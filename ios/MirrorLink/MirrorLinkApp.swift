@@ -38,7 +38,7 @@ struct ContentView: View {
                     row("PC", pcText, ok: c.link != nil)
                     row("Capture", c.isCapturing ? "Sharing screen" : "Off", ok: c.isCapturing)
                     if c.isCapturing && c.link != nil {
-                        row("Frames", "\(c.fps) fps", ok: c.fps > 0)
+                        row("Frames", "\(c.fps) fps · \(c.skipped) skipped · \(c.keyframes) key", ok: c.fps > 0)
                     }
                 }
                 .padding()

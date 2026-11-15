@@ -21,6 +21,7 @@ final class StreamServer {
     var onStatus: ((String) -> Void)?
     var onWifiStatus: ((String) -> Void)?
     var onPaired: (() -> Void)?
+    var onConfig: (([String: Any]) -> Void)?
 
     private let queue = DispatchQueue(label: "mirrorlink.net", qos: .userInteractive)
     private var usbListener: NWListener?
@@ -34,8 +35,9 @@ final class StreamServer {
     private var outstanding: [UInt64] = []
     private var dropping = false
     private var keyAskedWhileDropping = false
-    private let maxOutstandingUSB = 4
-    private let maxOutstandingWiFi = 6
+    private var skipped = 0
+    private var maxOutstandingUSB = 4
+    private var maxOutstandingWiFi = 6
 
     final class Session {
         enum State { case awaitClientHello, awaitClientProof, ready }
@@ -255,6 +257,19 @@ final class StreamServer {
 
     // MARK: Sending
 
+    /// How many unacknowledged frames are allowed before skipping starts.
+    func setLimits(usb: Int, wifi: Int) {
+        queue.async {
+            self.maxOutstandingUSB = max(1, usb)
+            self.maxOutstandingWiFi = max(1, wifi)
+        }
+    }
+
+    /// Frames skipped for lag control since the last call. (Never call from `queue`.)
+    func takeSkippedCount() -> Int {
+        queue.sync { let n = skipped; skipped = 0; return n }
+    }
+
     func setHello(_ json: [String: Any]) {
         queue.async {
             self.helloBase = json
@@ -287,10 +302,12 @@ final class StreamServer {
             if keyframe {
                 self.dropping = false
             } else if self.dropping {
+                self.skipped += 1
                 self.maybeRequestKeyframe(limit: limit)
                 return
             } else if self.outstanding.count >= limit {
                 // Link is behind: start skipping frames.
+                self.skipped += 1
                 self.dropping = true
                 self.keyAskedWhileDropping = false
                 return
@@ -393,6 +410,10 @@ final class StreamServer {
             let ts = Wire.readUInt64BE(payload)
             outstanding.removeAll { $0 <= ts }
             maybeRequestKeyframe(limit: s.link == .usb ? maxOutstandingUSB : maxOutstandingWiFi)
+        case .config:
+            guard s === active,
+                  let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return }
+            onConfig?(obj)
         case .pairRequest:
             // Only over the cable: physical access + "Trust This Computer" = allowed to pair.
             guard s.link == .usb else { return }

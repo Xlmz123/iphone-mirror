@@ -16,9 +16,28 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastBuffer: CVPixelBuffer?       // re-sent when a viewer joins on a static screen
     private var frameCount = 0
     private var lastStatsTime = CACurrentMediaTime()
+    private var lastEncodeTime: CFTimeInterval = 0   // capture-queue only
+
+    /// Speed/quality settings. Defaults here; the PC can change them live by
+    /// sending pc/settings.json (see apply(config:)).
+    struct Tuning {
+        /// Stream height cap. The PC window is ~1000 px tall, so capturing the full
+        /// ~2600 px native screen is ~4x the work for no visible gain.
+        var maxHeight: CGFloat = 1400
+        var maxFPS: Double = 60
+        var bitrateUSB = 1.0
+        var bitrateWiFi = 0.6
+        var queuedUSB = 4
+        var queuedWiFi = 6
+        var keyframeInterval = 3.0
+    }
+    private var tuning = Tuning()                    // guarded by lock
+    private var currentLink: LinkType?               // guarded by lock
+    private var lastFilter: SCContentFilter?         // main thread
+    private var lastPixelSize: CGSize = .zero        // main thread
 
     var onStopped: ((Error?) -> Void)?
-    var onFPS: ((Int) -> Void)?
+    var onStats: ((Int, Int, Int) -> Void)?        // (fps sent, frames skipped, keyframes) per second
     var onClientChanged: ((LinkType?) -> Void)?    // nil = disconnected
     var onServerStatus: ((String) -> Void)?
     var onWifiStatus: ((String) -> Void)?
@@ -36,9 +55,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             self?.server.sendVideo(data, keyframe: key, timestampUs: ts)
         }
         server.onKeyframeRequested = { [weak self] in self?.keyframeRequested() }
+        server.onConfig = { [weak self] cfg in self?.apply(config: cfg) }
         server.onClientConnected = { [weak self] link in
-            self?.encoder.setBitrateFactor(link == .wifi ? 0.6 : 1.0)
-            self?.setClientConnected(true)
+            guard let self else { return }
+            self.lock.lock()
+            self.currentLink = link
+            let t = self.tuning
+            self.lock.unlock()
+            self.encoder.setBitrateFactor(link == .wifi ? t.bitrateWiFi : t.bitrateUSB)
+            self.setClientConnected(true)
             self?.onClientChanged?(link)
         }
         server.onClientDisconnected = { [weak self] in
@@ -61,9 +86,13 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// `pixelSize`: the screen's native resolution in pixels (portrait).
     func start(filter: SCContentFilter, pixelSize: CGSize, completion: @escaping (Error?) -> Void) {
+        lastFilter = filter
+        lastPixelSize = pixelSize
+        lock.lock(); let maxHeight = tuning.maxHeight; lock.unlock()
         let config = SCStreamConfiguration()
-        config.width = Int(pixelSize.width) & ~1       // encoders want even sizes
-        config.height = Int(pixelSize.height) & ~1
+        let scale = min(1.0, maxHeight / max(pixelSize.height, 1))
+        config.width = Int(pixelSize.width * scale) & ~1       // encoders want even sizes
+        config.height = Int(pixelSize.height * scale) & ~1
         config.capturesAudio = false
 
         server.setHello(["w": config.width,
@@ -105,6 +134,41 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: Live tuning from the PC
+
+    /// Applies settings sent by the PC (pc/settings.json). Unknown keys are ignored;
+    /// values are clamped to sane ranges. Resolution changes restart the capture.
+    func apply(config c: [String: Any]) {
+        func num(_ k: String) -> Double? { (c[k] as? NSNumber)?.doubleValue }
+        func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double { min(hi, max(lo, v)) }
+
+        lock.lock()
+        let old = tuning
+        if let v = num("max_height") { tuning.maxHeight = CGFloat(clamp(v, 480, 3000)) }
+        if let v = num("max_fps") { tuning.maxFPS = clamp(v, 5, 120) }
+        if let v = num("bitrate_usb") { tuning.bitrateUSB = clamp(v, 0.1, 3) }
+        if let v = num("bitrate_wifi") { tuning.bitrateWiFi = clamp(v, 0.1, 3) }
+        if let v = num("max_queued_frames_usb") { tuning.queuedUSB = Int(clamp(v, 1, 30)) }
+        if let v = num("max_queued_frames_wifi") { tuning.queuedWiFi = Int(clamp(v, 1, 30)) }
+        if let v = num("keyframe_interval_s") { tuning.keyframeInterval = clamp(v, 1, 10) }
+        let t = tuning
+        let link = currentLink
+        lock.unlock()
+
+        encoder.setBitrateFactor(link == .wifi ? t.bitrateWiFi : t.bitrateUSB)
+        encoder.setKeyframeInterval(t.keyframeInterval)
+        server.setLimits(usb: t.queuedUSB, wifi: t.queuedWiFi)
+
+        if t.maxHeight != old.maxHeight {
+            DispatchQueue.main.async {
+                guard self.isCapturing, let f = self.lastFilter else { return }
+                self.restart(filter: f, pixelSize: self.lastPixelSize) { [weak self] error in
+                    if let error { self?.onStopped?(error) }
+                }
+            }
+        }
+    }
+
     // MARK: SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -126,6 +190,14 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
 
         guard sending else { return }       // nobody watching: don't burn battery encoding
+
+        // Cap at 60 fps. 120 Hz iPhones can deliver twice that, which doubles the
+        // work for no benefit on a 60 Hz PC monitor.
+        lock.lock(); let maxFPS = tuning.maxFPS; lock.unlock()
+        let now = CACurrentMediaTime()
+        guard now - lastEncodeTime >= 1.0 / (maxFPS + 2) else { return }
+        lastEncodeTime = now
+
         encoder.encode(pixelBuffer, pts: hostTime())
         countFrame()
     }
@@ -138,11 +210,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private func keyframeRequested() {
         encoder.requestKeyframe()
         captureQueue.async {
+            // If frames are flowing, the next one will carry the keyframe; only
+            // re-send the last frame when the screen is static.
+            guard CACurrentMediaTime() - self.lastEncodeTime > 0.1 else { return }
             self.lock.lock()
             let buf = self.lastBuffer
             let sending = self.clientConnected
             self.lock.unlock()
             if let buf, sending {
+                self.lastEncodeTime = CACurrentMediaTime()
                 self.encoder.encode(buf, pts: self.hostTime())
             }
         }
@@ -159,7 +235,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             let fps = Int(Double(frameCount) / (now - lastStatsTime) + 0.5)
             frameCount = 0
             lastStatsTime = now
-            onFPS?(fps)
+            onStats?(fps, server.takeSkippedCount(), encoder.takeKeyframeCount())
         }
     }
 }

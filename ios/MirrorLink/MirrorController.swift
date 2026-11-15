@@ -9,6 +9,8 @@ final class MirrorController: NSObject, ObservableObject {
     @Published var isCapturing = false
     @Published var link: LinkType?            // nil = no PC connected
     @Published var fps = 0
+    @Published var skipped = 0
+    @Published var keyframes = 0
     @Published var lastError: String?
     @Published var wifiStatus = ""
     @Published var wifiAddress: String?
@@ -45,8 +47,12 @@ final class MirrorController: NSObject, ObservableObject {
                 if link == nil { self?.fps = 0 }
             }
         }
-        engine.onFPS = { [weak self] fps in
-            Task { @MainActor in self?.fps = fps }
+        engine.onStats = { [weak self] fps, skipped, keys in
+            Task { @MainActor in
+                self?.fps = fps
+                self?.skipped = skipped
+                self?.keyframes = keys
+            }
         }
         engine.onPaired = { [weak self] in
             Task { @MainActor in

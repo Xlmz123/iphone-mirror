@@ -21,6 +21,7 @@ enum MsgType: UInt8 {
     case ping            = 0x11  // payload echoed back as pong
     case pong            = 0x12
     case ack             = 0x13  // payload: 8-byte timestamp of the video frame received
+    case config          = 0x14  // JSON tuning settings from pc/settings.json (see CaptureEngine.apply)
     case pairRequest     = 0x20  // USB only
 }
 
