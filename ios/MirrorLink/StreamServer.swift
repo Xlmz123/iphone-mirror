@@ -319,6 +319,17 @@ final class StreamServer {
         }
     }
 
+    /// JPEG frames are self-contained: if the link is behind, just skip this one.
+    func sendJPEG(_ jpeg: Data, timestampUs: UInt64) {
+        queue.async {
+            guard let s = self.active else { return }
+            let limit = s.link == .usb ? self.maxOutstandingUSB : self.maxOutstandingWiFi
+            if self.outstanding.count >= limit { self.skipped += 1; return }
+            self.outstanding.append(timestampUs)
+            self.transmit(s, Wire.frame(.jpegFrame, timestampUs: timestampUs, payload: jpeg))
+        }
+    }
+
     /// Once the backlog has mostly cleared, ask for a keyframe to resync.
     private func maybeRequestKeyframe(limit: Int) {
         guard dropping, !keyAskedWhileDropping, outstanding.count <= limit / 2 else { return }
