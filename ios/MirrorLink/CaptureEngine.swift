@@ -64,7 +64,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lock.unlock()
             self.encoder.setBitrateFactor(link == .wifi ? t.bitrateWiFi : t.bitrateUSB)
             self.setClientConnected(true)
-            self?.onClientChanged?(link)
+            self.onClientChanged?(link)
         }
         server.onClientDisconnected = { [weak self] in
             self?.setClientConnected(false)
