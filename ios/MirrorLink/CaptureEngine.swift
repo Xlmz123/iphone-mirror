@@ -126,9 +126,6 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         config.width = Int(pixelSize.width * scale) & ~1       // encoders want even sizes
         config.height = Int(pixelSize.height * scale) & ~1
         config.capturesAudio = false
-        // Deliver every screen refresh (up to 120 Hz); the pacing above picks the frames.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
-        config.queueDepth = 4
 
         var hello: [String: Any] = ["w": config.width, "h": config.height, "name": deviceName]
         if screenPoints.width > 0 {          // for Bluetooth control: the screen in points
