@@ -866,7 +866,9 @@ def main() -> None:
             rw, rh = (f.height, f.width) if rot in (90, 270) else (f.width, f.height)
             x, y, w, h = fit(rw, rh, aw, ah)
             sw_, sh_ = (h, w) if rot in (90, 270) else (w, h)     # size before rotation
-            rgb = f.to_ndarray(format="rgb24", width=sw_, height=sh_, interpolation="BILINEAR")
+            # Shrinking: AREA averages pixels (sharp text, no shimmer). Enlarging: BICUBIC.
+            interp = "AREA" if sw_ * sh_ < f.width * f.height else "BICUBIC"
+            rgb = f.to_ndarray(format="rgb24", width=sw_, height=sh_, interpolation=interp)
             if rot:
                 rgb = np.ascontiguousarray(np.rot90(rgb, k=-(rot // 90)))
             last_surface = pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")

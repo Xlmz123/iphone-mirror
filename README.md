@@ -180,9 +180,9 @@ Open it in Notepad, change a number, and save. Video settings apply within a sec
 | `bt_wheel_step` | 0.12 | How far one mouse-wheel notch scrolls |
 | `bt_scroll_speed` | 30 | Top scrolling speed |
 | `bt_coordinates` | `"screen"` | Try `"portrait"` only if clicks land in the wrong spot in landscape |
-| `max_height` | 1400 | Video height in pixels. Lower = less lag and less work for the phone. |
+| `max_height` | 2000 | Video height in pixels. Higher = sharper; lower it (1400) if fps drops or *decode* in F1 goes above ~10 ms. |
 | `max_fps` | 60 | Frame rate cap |
-| `bitrate_usb` / `bitrate_wifi` | 1.0 / 0.6 | Picture quality. Lower it if video stutters. |
+| `bitrate_usb` / `bitrate_wifi` | 2.5 / 0.6 | Picture quality over the cable / over Wi-Fi. Lower it if video stutters. |
 | `max_queued_frames_usb` / `_wifi` | 4 / 6 | Frames allowed in flight before the phone skips ahead. Lower = snappier. |
 | `keyframe_interval_s` | 3 | Seconds between full refresh frames |
 | `jpeg_max_fps` / `jpeg_quality` / `jpeg_max_height` | 60 / 0.6 / 1400 | Used only if iOS stops the fast video encoder in the background |
