@@ -118,6 +118,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     func start(filter: SCContentFilter, pixelSize: CGSize, completion: @escaping (Error?) -> Void) {
         lastFilter = filter
         lastPixelSize = pixelSize
+        captureQueue.async { self.orientationDiagLogged = false }
         lock.lock(); let maxHeight = tuning.maxHeight; lock.unlock()
         let config = SCStreamConfiguration()
         let scale = min(1.0, maxHeight / max(pixelSize.height, 1))
@@ -225,7 +226,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         let sending = clientConnected
         lock.unlock()
 
-        reportOrientation(sampleBuffer)
+        reportOrientation(sampleBuffer, pixelBuffer: pixelBuffer)
 
         guard sending else { return }       // nobody watching: don't burn battery encoding
 
@@ -307,12 +308,49 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// iOS 27 tags each frame with the screen's orientation. The pixels themselves
-    /// stay in the phone's native portrait layout, so the PC rotates the picture.
-    private func reportOrientation(_ sampleBuffer: CMSampleBuffer) {
-        guard let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
-              let info = arr.first,
-              let value = info[SCStreamFrameInfo.videoOrientation.rawValue] else { return }
+    /// Which way the screen content is turned (portrait, landscape left/right...). The
+    /// pixels themselves always arrive portrait. iOS can put this in several places
+    /// depending on the version, so look in all of them; the first time, write what
+    /// was there to the event log so it can be checked on a real phone.
+    private var orientationDiagLogged = false     // capture-queue only
+
+    private func reportOrientation(_ sampleBuffer: CMSampleBuffer, pixelBuffer: CVPixelBuffer) {
+        var found: Any?
+        var source = ""
+        let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]]
+        let info = arr?.first ?? [:]
+        if let v = info[SCStreamFrameInfo.videoOrientation.rawValue] {
+            found = v; source = "frame info"
+        } else if let kv = info.first(where: { $0.key.lowercased().contains("orient") }) {
+            found = kv.value; source = "frame info (\(kv.key))"
+        }
+        if found == nil {
+            for key in ["RPVideoSampleOrientationKey", SCStreamFrameInfo.videoOrientation.rawValue] {
+                if let v = CMGetAttachment(sampleBuffer, key: key as CFString, attachmentModeOut: nil) {
+                    found = v; source = "sample (\(key))"; break
+                }
+            }
+        }
+        let pbAttach = (CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) as? [String: Any]) ?? [:]
+        if found == nil, let kv = pbAttach.first(where: { $0.key.lowercased().contains("orient") }) {
+            found = kv.value; source = "pixel buffer (\(kv.key))"
+        }
+
+        // One-time report of what this iOS version attaches (only for frames with content).
+        if !orientationDiagLogged, info.count > 1 {
+            orientationDiagLogged = true
+            let short: (Any) -> String = { v in String(String(describing: v).prefix(40)) }
+            let infoKeys = info.keys.sorted().map { k -> String in
+                let name = k.replacingOccurrences(of: "SCStreamFrameInfo", with: "")
+                return name.lowercased().contains("rect") || name.lowercased().contains("orient")
+                    ? "\(name)=\(short(info[k]!))" : name
+            }
+            onLog?("Frame info: " + infoKeys.joined(separator: ", "))
+            onLog?("Pixel attachments: " + pbAttach.keys.sorted().joined(separator: ", "))
+            onLog?(found == nil ? "Orientation: not provided by iOS" : "Orientation from \(source)")
+        }
+
+        guard let value = found else { return }
         let raw: Any = (value as? NSNumber) ?? String(describing: value)
         let key = String(describing: raw)
         guard key != lastOrientation else { return }
