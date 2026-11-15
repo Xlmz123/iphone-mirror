@@ -4,8 +4,7 @@ where python >nul 2>nul || (echo Python is not installed. Get it from https://ww
 if not exist .venv (
   echo First run: setting up...
   python -m venv .venv || (pause & exit /b 1)
-  .venv\Scripts\python -m pip install -q --upgrade pip
-  .venv\Scripts\python -m pip install -q -r requirements.txt || (pause & exit /b 1)
 )
-.venv\Scripts\python mirror.py
+.venv\Scripts\python -m pip install -q --disable-pip-version-check -r requirements.txt || (pause & exit /b 1)
+.venv\Scripts\python mirror.py %*
 if errorlevel 1 pause

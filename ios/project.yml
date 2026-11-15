@@ -35,3 +35,7 @@ targets:
         # Keeps screen capture alive when you leave the app (iOS 27+).
         UIBackgroundModes:
           - screen-capture
+        # Wi-Fi mirroring: lets the PC find this iPhone on the local network.
+        NSBonjourServices:
+          - _mirrorlink._tcp
+        NSLocalNetworkUsageDescription: MirrorLink uses your local network so your paired PC can show your screen over Wi-Fi.

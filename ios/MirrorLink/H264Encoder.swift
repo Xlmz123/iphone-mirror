@@ -16,12 +16,28 @@ final class H264Encoder {
     private(set) var width: Int32 = 0
     private(set) var height: Int32 = 0
     private var forceKeyframe = true
+    private var bitrateFactor = 1.0          // lower on Wi-Fi
+    private var bitrateDirty = false
     private let lock = NSLock()
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]
 
     func requestKeyframe() {
         lock.lock(); forceKeyframe = true; lock.unlock()
+    }
+
+    /// 1.0 for USB; less for Wi-Fi, where a smaller stream means fewer stalls.
+    func setBitrateFactor(_ f: Double) {
+        lock.lock()
+        if f != bitrateFactor { bitrateFactor = f; bitrateDirty = true }
+        lock.unlock()
+    }
+
+    private func targetBitrate(_ w: Int32, _ h: Int32) -> Int {
+        lock.lock(); let f = bitrateFactor; lock.unlock()
+        // ~0.08 bits per pixel per frame at 60 fps, scaled by link.
+        let base = Double(w) * Double(h) * 60 * 0.08 * f
+        return max(3_000_000, min(30_000_000, Int(base)))
     }
 
     func invalidate() {
@@ -54,8 +70,7 @@ final class H264Encoder {
 
         guard let s = create(lowLatency: true) ?? create(lowLatency: false) else { return false }
 
-        // Bitrate scales with resolution; ~0.1 bits/pixel/frame at 60 fps.
-        let bitrate = max(4_000_000, min(30_000_000, Int(Double(width * height) * 60 * 0.08)))
+        let bitrate = targetBitrate(width, height)
 
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
@@ -89,7 +104,14 @@ final class H264Encoder {
         lock.lock()
         let key = forceKeyframe
         forceKeyframe = false
+        let dirty = bitrateDirty
+        bitrateDirty = false
         lock.unlock()
+
+        if dirty {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                                 value: targetBitrate(width, height) as CFNumber)
+        }
 
         let props: CFDictionary? = key
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary

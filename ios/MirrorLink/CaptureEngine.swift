@@ -5,7 +5,7 @@ import UIKit
 
 /// Screen capture (ScreenCaptureKit, iOS 27+) -> H.264 encoder -> USB server.
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
-    let server = StreamServer()
+    let server: StreamServer
     private let encoder = H264Encoder()
     private var stream: SCStream?
     private let captureQueue = DispatchQueue(label: "mirrorlink.capture", qos: .userInteractive)
@@ -19,25 +19,36 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     var onStopped: ((Error?) -> Void)?
     var onFPS: ((Int) -> Void)?
-    var onClientChanged: ((Bool) -> Void)?
+    var onClientChanged: ((LinkType?) -> Void)?    // nil = disconnected
     var onServerStatus: ((String) -> Void)?
+    var onWifiStatus: ((String) -> Void)?
+    var onPaired: (() -> Void)?
 
-    override init() {
+    private let deviceName: String
+
+    /// Call from the main thread (UIKit values are passed in, not read here).
+    init(wifiEnabled: Bool, deviceName: String) {
+        server = StreamServer(wifiEnabled: wifiEnabled)
+        self.deviceName = deviceName
         super.init()
+        server.setHello(["name": deviceName])
         encoder.onEncoded = { [weak self] data, key, ts in
             self?.server.sendVideo(data, keyframe: key, timestampUs: ts)
         }
         server.onKeyframeRequested = { [weak self] in self?.keyframeRequested() }
-        server.onClientConnected = { [weak self] in
+        server.onClientConnected = { [weak self] link in
+            self?.encoder.setBitrateFactor(link == .wifi ? 0.6 : 1.0)
             self?.setClientConnected(true)
-            self?.onClientChanged?(true)
+            self?.onClientChanged?(link)
         }
         server.onClientDisconnected = { [weak self] in
             self?.setClientConnected(false)
-            self?.onClientChanged?(false)
+            self?.onClientChanged?(nil)
         }
         server.onStatus = { [weak self] msg in self?.onServerStatus?(msg) }
-        server.start()
+        server.onWifiStatus = { [weak self] msg in self?.onWifiStatus?(msg) }
+        server.onPaired = { [weak self] in self?.onPaired?() }
+        // server.start() is called by the owner after it has hooked up callbacks.
     }
 
     var isCapturing: Bool { stream != nil }
@@ -48,18 +59,16 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: Start / stop
 
-    func start(filter: SCContentFilter, completion: @escaping (Error?) -> Void) {
+    /// `pixelSize`: the screen's native resolution in pixels (portrait).
+    func start(filter: SCContentFilter, pixelSize: CGSize, completion: @escaping (Error?) -> Void) {
         let config = SCStreamConfiguration()
-        // Capture at the phone's native pixel resolution (portrait).
-        let native = UIScreen.main.nativeBounds.size
-        config.width = Int(native.width) & ~1       // encoders want even sizes
-        config.height = Int(native.height) & ~1
+        config.width = Int(pixelSize.width) & ~1       // encoders want even sizes
+        config.height = Int(pixelSize.height) & ~1
         config.capturesAudio = false
 
-        server.setHello(["v": 1,
-                         "w": config.width,
+        server.setHello(["w": config.width,
                          "h": config.height,
-                         "name": UIDevice.current.name])
+                         "name": deviceName])
 
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         do {

@@ -1,164 +1,383 @@
 import Foundation
 import Network
+import CryptoKit
 
-/// TCP server bound to the phone's loopback interface. The Windows PC reaches it
-/// through the USB cable via Apple's usbmux service (the same channel iTunes uses),
-/// so nothing is exposed on Wi-Fi.
+enum LinkType: String { case usb, wifi }
+
+/// Two listeners, one viewer at a time:
+///  - USB  (port 47800): bound to loopback; the PC reaches it through the cable
+///    via Apple's usbmux service. Plain messages; also hands out the pairing key.
+///  - Wi-Fi (port 47801): advertised with Bonjour; every connection must prove it
+///    holds the pairing key, and all traffic is encrypted (SecureChannel).
+///
+/// Lag control: the PC acknowledges each video frame as it arrives. If too many
+/// frames are unacknowledged (the link is falling behind), new frames are dropped
+/// until the backlog clears, then a fresh keyframe resyncs the picture. This keeps
+/// what you see current instead of letting a delay build up.
 final class StreamServer {
-    var onClientConnected: (() -> Void)?
+    var onClientConnected: ((LinkType) -> Void)?
     var onClientDisconnected: (() -> Void)?
     var onKeyframeRequested: (() -> Void)?
     var onStatus: ((String) -> Void)?
+    var onWifiStatus: ((String) -> Void)?
+    var onPaired: (() -> Void)?
 
-    private let queue = DispatchQueue(label: "mirrorlink.net")
-    private var listener: NWListener?
-    private var client: NWConnection?
-    private var inflight = 0                 // sends not yet handed to the kernel
-    private var droppingUntilKeyframe = false
-    private var rxBuffer = Data()
-    private var helloPayload: Data?
+    private let queue = DispatchQueue(label: "mirrorlink.net", qos: .userInteractive)
+    private var usbListener: NWListener?
+    private var wifiListener: NWListener?
+    private var wifiEnabled: Bool
+    private var active: Session?
+    private var pending: [ObjectIdentifier: Session] = [:]   // connected, not yet active (keeps them alive)
+    private var helloBase: [String: Any] = [:]
 
-    /// Max frames allowed to queue before we start dropping (keeps latency low
-    /// instead of letting a backlog build up).
-    private let maxInflight = 3
+    // Lag control state (queue-confined)
+    private var outstanding: [UInt64] = []
+    private var dropping = false
+    private var keyAskedWhileDropping = false
+    private let maxOutstandingUSB = 4
+    private let maxOutstandingWiFi = 6
 
-    func start() {
-        queue.async { self.startListener() }
-    }
+    final class Session {
+        enum State { case awaitClientHello, awaitClientProof, ready }
+        let conn: NWConnection
+        let link: LinkType
+        var state: State
+        var raw = Data()        // bytes off the socket
+        var plain = Data()      // decrypted protocol bytes
+        var channel: SecureChannel?
+        var nonceC = Data()
+        var nonceS = Data()
+        var closed = false
 
-    private func startListener() {
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        let params = NWParameters(tls: nil, tcp: tcp)
-        params.requiredInterfaceType = .loopback
-        params.allowLocalEndpointReuse = true
-
-        do {
-            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Wire.port)!)
-            l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
-            l.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready: self?.onStatus?("Waiting for PC on USB…")
-                case .failed(let err):
-                    self?.onStatus?("Server error: \(err). Retrying…")
-                    self?.listener?.cancel()
-                    self?.queue.asyncAfter(deadline: .now() + 1) { self?.startListener() }
-                default: break
-                }
-            }
-            l.start(queue: queue)
-            listener = l
-        } catch {
-            onStatus?("Could not start server: \(error)")
+        init(_ conn: NWConnection, _ link: LinkType) {
+            self.conn = conn
+            self.link = link
+            self.state = link == .usb ? .ready : .awaitClientHello
         }
     }
 
-    private func accept(_ conn: NWConnection) {
-        // Only one viewer at a time: newest wins.
-        client?.cancel()
-        client = conn
-        inflight = 0
-        rxBuffer.removeAll()
-        droppingUntilKeyframe = true          // first thing the PC needs is a keyframe
+    init(wifiEnabled: Bool) {
+        self.wifiEnabled = wifiEnabled
+    }
 
-        conn.stateUpdateHandler = { [weak self, weak conn] state in
-            guard let self, let conn else { return }
+    func start() {
+        queue.async {
+            self.startUSB()
+            if self.wifiEnabled { self.startWiFi() } else { self.onWifiStatus?("Wi-Fi off") }
+        }
+    }
+
+    // MARK: Listeners
+
+    private func tcpParams() -> NWParameters {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let p = NWParameters(tls: nil, tcp: tcp)
+        p.allowLocalEndpointReuse = true
+        return p
+    }
+
+    private func startUSB() {
+        let params = tcpParams()
+        params.requiredInterfaceType = .loopback
+        guard let l = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: Wire.usbPort)!) else {
+            onStatus?("Could not open USB port"); return
+        }
+        l.newConnectionHandler = { [weak self] c in self?.accept(c, .usb) }
+        l.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready: self.onStatus?("Ready")
+            case .failed:
+                l.cancel()
+                self.queue.asyncAfter(deadline: .now() + 1) { self.startUSB() }
+            default: break
+            }
+        }
+        l.start(queue: queue)
+        usbListener = l
+    }
+
+    private func startWiFi() {
+        wifiListener?.cancel()
+        let params = tcpParams()
+        params.prohibitedInterfaceTypes = [.cellular, .loopback]
+        guard let l = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: Wire.wifiPort)!) else {
+            onWifiStatus?("Could not open Wi-Fi port"); return
+        }
+        l.service = NWListener.Service(name: nil, type: Wire.bonjourType, domain: nil,
+                                       txtRecord: NWTXTRecord(["id": Pairing.shared.idHex]))
+        l.newConnectionHandler = { [weak self] c in self?.accept(c, .wifi) }
+        l.stateUpdateHandler = { [weak self, weak l] state in
+            guard let self, let l, self.wifiListener === l else { return }
             switch state {
             case .ready:
-                if let hello = self.helloPayload {
-                    conn.send(content: Wire.frame(.hello, timestampUs: Wire.nowUs(), payload: hello),
-                              completion: .contentProcessed { _ in })
+                self.onWifiStatus?("Wi-Fi ready")
+            case .waiting(let err):
+                self.onWifiStatus?(StreamServer.describe(err))
+            case .failed(let err):
+                self.onWifiStatus?(StreamServer.describe(err))
+                l.cancel()
+                self.queue.asyncAfter(deadline: .now() + 2) {
+                    if self.wifiEnabled && self.wifiListener === l { self.startWiFi() }
                 }
-                self.onClientConnected?()
-                self.onKeyframeRequested?()
-                self.receive(on: conn)
+            default: break
+            }
+        }
+        l.start(queue: queue)
+        wifiListener = l
+    }
+
+    private static func describe(_ err: NWError) -> String {
+        if case .dns(let code) = err, code == -65570 {   // kDNSServiceErr_PolicyDenied
+            return "Allow Local Network: Settings → Privacy & Security → Local Network → MirrorLink"
+        }
+        return "Wi-Fi unavailable (\(err))"
+    }
+
+    func setWifiEnabled(_ on: Bool) {
+        queue.async {
+            self.wifiEnabled = on
+            if on {
+                self.startWiFi()
+            } else {
+                self.wifiListener?.cancel()
+                self.wifiListener = nil
+                self.dropWiFiSessions()
+                self.onWifiStatus?("Wi-Fi off")
+            }
+        }
+    }
+
+    /// New key + ID. Every previously paired PC must pair over USB again.
+    func resetPairing() {
+        queue.async {
+            Pairing.shared.regenerate()
+            self.dropWiFiSessions()
+            if self.wifiEnabled { self.startWiFi() }   // re-advertise with the new ID
+        }
+    }
+
+    private func dropWiFiSessions() {
+        for s in pending.values where s.link == .wifi { s.conn.cancel() }
+        if let a = active, a.link == .wifi { a.conn.cancel() }
+    }
+
+    // MARK: Connections
+
+    private func accept(_ conn: NWConnection, _ link: LinkType) {
+        let s = Session(conn, link)
+        pending[ObjectIdentifier(s)] = s
+        if link == .wifi {
+            // Unauthenticated connections get 5 seconds to prove themselves.
+            queue.asyncAfter(deadline: .now() + 5) { [weak self, weak s] in
+                guard let self, let s, s.state != .ready else { return }
+                self.close(s)
+            }
+        }
+        conn.stateUpdateHandler = { [weak self, weak s] state in
+            guard let self, let s else { return }
+            switch state {
+            case .ready:
+                if s.link == .usb { self.activate(s) }
+                self.receive(s)
             case .failed, .cancelled:
-                if self.client === conn {
-                    self.client = nil
-                    self.onClientDisconnected?()
-                }
+                self.closed(s)
             default: break
             }
         }
         conn.start(queue: queue)
     }
 
+    private func activate(_ s: Session) {
+        pending.removeValue(forKey: ObjectIdentifier(s))
+        let old = active
+        active = s                      // set first so the old one's teardown is ignored
+        old?.conn.cancel()
+        outstanding.removeAll()
+        dropping = true                 // nothing useful until a keyframe
+        keyAskedWhileDropping = true
+
+        var hello = helloBase
+        hello["v"] = 2
+        hello["id"] = Pairing.shared.idHex
+        hello["link"] = s.link.rawValue
+        if let data = try? JSONSerialization.data(withJSONObject: hello) {
+            transmit(s, Wire.frame(.hello, timestampUs: Wire.nowUs(), payload: data))
+        }
+        onClientConnected?(s.link)
+        onKeyframeRequested?()
+    }
+
+    private func close(_ s: Session) {
+        s.conn.cancel()
+    }
+
+    private func closed(_ s: Session) {
+        guard !s.closed else { return }
+        s.closed = true
+        pending.removeValue(forKey: ObjectIdentifier(s))
+        if active === s {
+            active = nil
+            outstanding.removeAll()
+            onClientDisconnected?()
+        }
+    }
+
     // MARK: Sending
 
-    /// Set the hello message (stream size etc). Sent to every new viewer.
     func setHello(_ json: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
         queue.async {
-            self.helloPayload = data
-            if let c = self.client {
-                c.send(content: Wire.frame(.hello, timestampUs: Wire.nowUs(), payload: data),
-                       completion: .contentProcessed { _ in })
+            self.helloBase = json
+            guard let s = self.active else { return }
+            var hello = json
+            hello["v"] = 2
+            hello["id"] = Pairing.shared.idHex
+            hello["link"] = s.link.rawValue
+            if let data = try? JSONSerialization.data(withJSONObject: hello) {
+                self.transmit(s, Wire.frame(.hello, timestampUs: Wire.nowUs(), payload: data))
             }
+        }
+    }
+
+    private func transmit(_ s: Session, _ msg: Data) {
+        guard !s.closed else { return }
+        if s.link == .wifi {
+            guard let ch = s.channel, let record = try? ch.seal(msg) else { return }
+            s.conn.send(content: record, completion: .contentProcessed { _ in })
+        } else {
+            s.conn.send(content: msg, completion: .contentProcessed { _ in })
         }
     }
 
     func sendVideo(_ annexB: Data, keyframe: Bool, timestampUs: UInt64) {
         queue.async {
-            guard let c = self.client else { return }
+            guard let s = self.active else { return }
+            let limit = s.link == .usb ? self.maxOutstandingUSB : self.maxOutstandingWiFi
 
             if keyframe {
-                self.droppingUntilKeyframe = false
-            } else if self.droppingUntilKeyframe {
+                self.dropping = false
+            } else if self.dropping {
+                self.maybeRequestKeyframe(limit: limit)
+                return
+            } else if self.outstanding.count >= limit {
+                // Link is behind: start skipping frames.
+                self.dropping = true
+                self.keyAskedWhileDropping = false
                 return
             }
 
-            // Backpressure: if the link can't keep up, drop instead of queueing.
-            // Dropping a delta frame corrupts following frames, so we skip until
-            // the next keyframe and ask the encoder for one right away.
-            if self.inflight >= self.maxInflight && !keyframe {
-                self.droppingUntilKeyframe = true
-                self.onKeyframeRequested?()
-                return
-            }
-
-            self.inflight += 1
-            let msg = Wire.frame(keyframe ? .videoKey : .videoDelta, timestampUs: timestampUs, payload: annexB)
-            c.send(content: msg, completion: .contentProcessed { [weak self] _ in
-                self?.inflight -= 1     // runs on self.queue
-            })
+            self.outstanding.append(timestampUs)
+            self.transmit(s, Wire.frame(keyframe ? .videoKey : .videoDelta,
+                                        timestampUs: timestampUs, payload: annexB))
         }
     }
 
-    // MARK: Receiving (PC -> phone)
+    /// Once the backlog has mostly cleared, ask for a keyframe to resync.
+    private func maybeRequestKeyframe(limit: Int) {
+        guard dropping, !keyAskedWhileDropping, outstanding.count <= limit / 2 else { return }
+        keyAskedWhileDropping = true
+        onKeyframeRequested?()
+    }
 
-    private func receive(on conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+    // MARK: Receiving
+
+    private func receive(_ s: Session) {
+        s.conn.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self, !s.closed else { return }
             if let data, !data.isEmpty {
-                self.rxBuffer.append(data)
-                self.parseMessages(conn)
+                s.raw.append(data)
+                if !self.process(s) { self.close(s); return }
             }
-            if isComplete || error != nil {
-                conn.cancel()
-                return
-            }
-            self.receive(on: conn)
+            if isComplete || error != nil { self.close(s); return }
+            self.receive(s)
         }
     }
 
-    private func parseMessages(_ conn: NWConnection) {
-        while rxBuffer.count >= Wire.headerSize {
-            let b = [UInt8](rxBuffer.prefix(Wire.headerSize))
-            let len = Int(UInt32(b[0]) << 24 | UInt32(b[1]) << 16 | UInt32(b[2]) << 8 | UInt32(b[3]))
-            guard rxBuffer.count >= Wire.headerSize + len else { return }
-            let type = b[4]
-            let payload = rxBuffer.subdata(in: rxBuffer.startIndex + Wire.headerSize ..< rxBuffer.startIndex + Wire.headerSize + len)
-            rxBuffer.removeFirst(Wire.headerSize + len)
+    /// Returns false if the connection should be dropped.
+    private func process(_ s: Session) -> Bool {
+        if s.link == .usb {
+            s.plain.append(s.raw)
+            s.raw.removeAll(keepingCapacity: true)
+            parseMessages(s)
+            return true
+        }
 
-            switch MsgType(rawValue: type) {
-            case .requestKeyframe:
-                onKeyframeRequested?()
-            case .ping:
-                conn.send(content: Wire.frame(.pong, timestampUs: Wire.nowUs(), payload: payload),
-                          completion: .contentProcessed { _ in })
-            default:
-                break   // future: input events go here (step 2)
+        // Wi-Fi: handshake first.
+        if s.state == .awaitClientHello {
+            guard s.raw.count >= Handshake.clientHelloSize else { return true }
+            let hello = Data(s.raw.prefix(Handshake.clientHelloSize))
+            s.raw = Data(s.raw.dropFirst(Handshake.clientHelloSize))
+            guard hello.prefix(4) == Handshake.magic,
+                  Data(hello[4..<20]) == Pairing.shared.id else { return false }
+            s.nonceC = Data(hello[20..<52])
+            s.nonceS = Pairing.random(32)
+            let reply = s.nonceS + Handshake.serverProof(Pairing.shared.key, s.nonceC, s.nonceS)
+            s.conn.send(content: reply, completion: .contentProcessed { _ in })
+            s.state = .awaitClientProof
+        }
+        if s.state == .awaitClientProof {
+            guard s.raw.count >= Handshake.clientProofSize else { return true }
+            let proof = Data(s.raw.prefix(Handshake.clientProofSize))
+            s.raw = Data(s.raw.dropFirst(Handshake.clientProofSize))
+            guard Handshake.verifyClientProof(proof, Pairing.shared.key, s.nonceC, s.nonceS) else { return false }
+            s.channel = SecureChannel(master: Pairing.shared.key, nonceC: s.nonceC, nonceS: s.nonceS)
+            s.state = .ready
+            activate(s)
+        }
+
+        // Encrypted records.
+        while s.raw.count >= 4 {
+            let b = [UInt8](s.raw.prefix(4))
+            let len = Int(UInt32(b[0]) << 24 | UInt32(b[1]) << 16 | UInt32(b[2]) << 8 | UInt32(b[3]))
+            guard len <= 1 << 20 else { return false }
+            guard s.raw.count >= 4 + len else { break }
+            let body = Data(s.raw.dropFirst(4).prefix(len))
+            s.raw = Data(s.raw.dropFirst(4 + len))
+            guard let ch = s.channel, let plain = try? ch.open(body) else { return false }
+            s.plain.append(plain)
+        }
+        parseMessages(s)
+        return true
+    }
+
+    private func parseMessages(_ s: Session) {
+        while s.plain.count >= Wire.headerSize {
+            let b = [UInt8](s.plain.prefix(Wire.headerSize))
+            let len = Int(UInt32(b[0]) << 24 | UInt32(b[1]) << 16 | UInt32(b[2]) << 8 | UInt32(b[3]))
+            guard s.plain.count >= Wire.headerSize + len else { return }
+            let type = b[4]
+            let payload = Data(s.plain.dropFirst(Wire.headerSize).prefix(len))
+            s.plain = Data(s.plain.dropFirst(Wire.headerSize + len))
+            handle(type, payload, from: s)
+        }
+    }
+
+    private func handle(_ type: UInt8, _ payload: Data, from s: Session) {
+        switch MsgType(rawValue: type) {
+        case .ping:
+            transmit(s, Wire.frame(.pong, timestampUs: Wire.nowUs(), payload: payload))
+        case .requestKeyframe:
+            if s === active { onKeyframeRequested?() }
+        case .ack:
+            guard s === active, payload.count >= 8 else { return }
+            let ts = Wire.readUInt64BE(payload)
+            outstanding.removeAll { $0 <= ts }
+            maybeRequestKeyframe(limit: s.link == .usb ? maxOutstandingUSB : maxOutstandingWiFi)
+        case .pairRequest:
+            // Only over the cable: physical access + "Trust This Computer" = allowed to pair.
+            guard s.link == .usb else { return }
+            let info: [String: Any] = [
+                "id": Pairing.shared.idHex,
+                "key": Pairing.shared.keyData.base64EncodedString(),
+                "name": (helloBase["name"] as? String) ?? "iPhone",
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: info) {
+                transmit(s, Wire.frame(.pairInfo, timestampUs: Wire.nowUs(), payload: data))
+                onPaired?()
             }
+        default:
+            break   // step 2: input events go here
         }
     }
 }
