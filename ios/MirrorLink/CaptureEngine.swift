@@ -84,8 +84,16 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func update(filter: SCContentFilter) {
-        stream?.updateContentFilter(filter) { _ in }
+    /// iOS can't change what a running stream captures, so stop it and start a new one.
+    func restart(filter: SCContentFilter, pixelSize: CGSize, completion: @escaping (Error?) -> Void) {
+        guard let old = stream else {
+            start(filter: filter, pixelSize: pixelSize, completion: completion)
+            return
+        }
+        stream = nil
+        old.stopCapture { [weak self] _ in
+            self?.start(filter: filter, pixelSize: pixelSize, completion: completion)
+        }
     }
 
     func stop() {
@@ -100,6 +108,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard stream === self.stream else { return }   // an old stream we replaced
         self.stream = nil
         onStopped?(error)
     }
