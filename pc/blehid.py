@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 4          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 5          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -263,6 +263,16 @@ class WinHid:
         adapter = await W["BluetoothAdapter"].get_default_async()
         if adapter is None:
             raise RuntimeError("this PC has no Bluetooth adapter (or it's turned off in Device Manager)")
+        def cap(name):
+            try:
+                return getattr(adapter, name)
+            except (AttributeError, OSError):
+                return "?"
+        log(f"adapter: address {cap('bluetooth_address'):x} · classic {cap('is_classic_supported')} · "
+            f"LE peripheral {cap('is_peripheral_role_supported')} · LE secure connections "
+            f"{cap('are_low_energy_secure_connections_supported')} · extended advertising "
+            f"{cap('is_extended_advertising_supported')} · max advertisement data {cap('max_advertisement_data_length')}"
+            if isinstance(cap('bluetooth_address'), int) else "adapter: (details unavailable)")
         if not adapter.is_low_energy_supported or not adapter.is_peripheral_role_supported:
             raise RuntimeError("this PC's Bluetooth can't act as a keyboard/mouse (no LE peripheral role)")
         try:
@@ -305,6 +315,7 @@ class WinHid:
             p.start_advertising(self._adv_params())
         await asyncio.sleep(1.0)        # Windows sometimes reports ABORTED on the way up, then starts
         for name, p in self.providers:
+            log(f"{name} service advertisement: {g.GattServiceProviderAdvertisementStatus(p.advertisement_status).name}")
             if not self._advertising(p):
                 st = g.GattServiceProviderAdvertisementStatus(p.advertisement_status).name
                 raise RuntimeError(f"Windows didn't start advertising the {name} service ({st})")
@@ -384,6 +395,11 @@ class WinHid:
         asyncio.run_coroutine_threadsafe(take(), self.loop)
 
     def _on_adv(self, gen: int, name: str, provider) -> None:
+        try:
+            log(f"{name} service advertisement now: "
+                f"{self.g.GattServiceProviderAdvertisementStatus(provider.advertisement_status).name}")
+        except (OSError, ValueError):
+            pass
         if gen != self.generation or self._advertising(provider) or self.readvertising:
             return
         log(f"advertising the {name} service stopped; starting it again")
