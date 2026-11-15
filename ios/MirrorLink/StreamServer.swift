@@ -78,17 +78,36 @@ final class StreamServer {
     }
 
     private func startUSB() {
+        // Listen normally, but only accept connections that come from the phone itself
+        // (loopback). That's how usbmux delivers traffic from the USB cable. Anything from
+        // the network is rejected in accept(). (Restricting the listener to the loopback
+        // interface type directly isn't reliable on iOS.)
         let params = tcpParams()
-        params.requiredInterfaceType = .loopback
-        guard let l = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: Wire.usbPort)!) else {
-            onStatus?("Could not open USB port"); return
+        params.prohibitedInterfaceTypes = [.cellular]
+        let l: NWListener
+        do {
+            l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Wire.usbPort)!)
+        } catch {
+            onStatus?("USB: could not open port \(Wire.usbPort): \(error)")
+            queue.asyncAfter(deadline: .now() + 2) { self.startUSB() }
+            return
         }
-        l.newConnectionHandler = { [weak self] c in self?.accept(c, .usb) }
+        l.newConnectionHandler = { [weak self] c in
+            guard let self else { return }
+            if StreamServer.isLoopback(c.endpoint) {
+                self.accept(c, .usb)
+            } else {
+                self.onStatus?("USB: ignored a connection from \(c.endpoint)")
+                c.cancel()   // not from the cable
+            }
+        }
         l.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
-            case .ready: self.onStatus?("Ready")
-            case .failed:
+            case .ready: self.onStatus?("USB ready (port \(Wire.usbPort))")
+            case .waiting(let err): self.onStatus?("USB waiting: \(err)")
+            case .failed(let err):
+                self.onStatus?("USB failed: \(err) — retrying")
                 l.cancel()
                 self.queue.asyncAfter(deadline: .now() + 1) { self.startUSB() }
             default: break
@@ -126,6 +145,16 @@ final class StreamServer {
         }
         l.start(queue: queue)
         wifiListener = l
+    }
+
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let a): return a.isLoopback
+        case .ipv6(let a): return a.isLoopback || (a.asIPv4?.isLoopback ?? false)
+        case .name(let n, _): return n == "localhost"
+        @unknown default: return false
+        }
     }
 
     private static func describe(_ err: NWError) -> String {
