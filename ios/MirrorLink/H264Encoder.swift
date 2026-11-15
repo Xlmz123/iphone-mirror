@@ -23,6 +23,9 @@ final class H264Encoder {
     private var keyIntervalDirty = false
     private var lastForcedKey: CFTimeInterval = 0
     private var errorCount = 0            // encode failures since last takeErrorCount()
+    private var successCount = 0          // frames encoded OK since last takeSuccessCount()
+    private var generation = 0            // bumps with each new session, so late results from
+                                          // a dead session aren't blamed on the new one
     private var needsReset = false        // iOS invalidated the session (-12903)
     private var keyframeCount = 0
     private let lock = NSLock()
@@ -39,8 +42,15 @@ final class H264Encoder {
         let n = errorCount; errorCount = 0; return n
     }
 
-    private func noteError(_ status: OSStatus) {
+    /// Frames successfully encoded since the last call.
+    func takeSuccessCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let n = successCount; successCount = 0; return n
+    }
+
+    private func noteError(_ status: OSStatus, gen: Int? = nil) {
         lock.lock()
+        if let gen, gen != generation { lock.unlock(); return }   // stale: from an old session
         errorCount += 1
         if status == kVTInvalidSessionErr { needsReset = true }
         lock.unlock()
@@ -73,6 +83,7 @@ final class H264Encoder {
     }
 
     func invalidate() {
+        lock.lock(); generation += 1; lock.unlock()
         if let s = session {
             VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(s)
@@ -169,12 +180,14 @@ final class H264Encoder {
             : nil
         let ts = Wire.nowUs()
 
+        lock.lock(); let gen = generation; lock.unlock()
         let submit = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
             duration: .invalid, frameProperties: props, infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
             guard let self else { return }
-            guard status == noErr, let sampleBuffer else { self.noteError(status); return }
+            guard status == noErr, let sampleBuffer else { self.noteError(status, gen: gen); return }
+            self.lock.lock(); if gen == self.generation { self.successCount += 1 }; self.lock.unlock()
             self.handleOutput(sampleBuffer, timestampUs: ts)
         }
         if submit != noErr {

@@ -9,6 +9,7 @@
   "jpeg_max_fps": 60,
   "jpeg_quality": 0.6,
   "orientation_map": {},
+  "jpeg_max_height": 1400,
   "_help": {
     "max_height": "Stream height in pixels (480-3000). Lower = less lag and less phone load. ~1000-1400 matches a laptop screen.",
     "max_fps": "Frame rate cap (5-120). 60 matches most monitors.",
@@ -19,6 +20,7 @@
     "keyframe_interval_s": "Seconds between full refresh frames (1-10). Lower heals glitches faster but uses more data.",
     "jpeg_max_fps": "Frame-rate cap while the MirrorLink app is in the background (JPEG mode, CPU-encoded), 5-60. Older iPhones may run lower.",
     "jpeg_quality": "JPEG quality in background mode (0.2-0.95). Lower = smoother on slow links.",
-    "orientation_map": "Only if landscape shows sideways: map the phone's orientation value (shown in F1 stats) to degrees, e.g. {\"6\": 270}. Ctrl+R also rotates by hand."
+    "orientation_map": "Only if landscape shows sideways: map the phone's orientation value (shown in F1 stats) to degrees, e.g. {\"6\": 270}. Ctrl+R also rotates by hand.",
+    "jpeg_max_height": "Picture height while the app is in the background (JPEG mode). Lower (e.g. 1000) = more fps on the CPU encoder."
   }
 }

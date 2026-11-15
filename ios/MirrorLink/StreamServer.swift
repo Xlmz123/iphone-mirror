@@ -39,6 +39,7 @@ final class StreamServer {
     private var dropping = false
     private var keyAskedWhileDropping = false
     private var skipped = 0
+    private var lastJPEGTs: UInt64 = 0
     private var maxOutstandingUSB = 4
     private var maxOutstandingWiFi = 6
 
@@ -356,7 +357,10 @@ final class StreamServer {
         queue.async {
             guard let s = self.active else { return }
             let limit = s.link == .usb ? self.maxOutstandingUSB : self.maxOutstandingWiFi
+            // Several frames compress in parallel; never send one older than the last.
+            if timestampUs <= self.lastJPEGTs { self.skipped += 1; return }
             if self.outstanding.count >= limit { self.skipped += 1; return }
+            self.lastJPEGTs = timestampUs
             self.outstanding.append(timestampUs)
             self.transmit(s, Wire.frame(.jpegFrame, timestampUs: timestampUs, payload: jpeg))
         }
