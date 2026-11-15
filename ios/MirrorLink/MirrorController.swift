@@ -156,6 +156,8 @@ final class MirrorController: NSObject, ObservableObject {
 
     fileprivate func pickerReturned(filter: SCContentFilter, existingStream: SCStream?) {
         let size = UIScreen.main.nativeBounds.size
+        let scale = max(UIScreen.main.nativeScale, 1)
+        engine.screenPoints = CGSize(width: size.width / scale, height: size.height / scale)
         engine.restart(filter: filter, pixelSize: size) { [weak self] error in
             Task { @MainActor in
                 guard let self else { return }

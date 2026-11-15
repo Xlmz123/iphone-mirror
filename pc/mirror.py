@@ -103,6 +103,7 @@ class Receiver(threading.Thread):
         self.usb_only = usb_only
         self.status = "Starting…"
         self.device_name = ""
+        self.points: tuple[float, float] | None = None   # the phone's screen in points (portrait)
         self.size: tuple[int, int] | None = None
         self.link_kind: str | None = None        # "usb" / "wifi" / None
         self._latest: av.VideoFrame | None = None
@@ -346,6 +347,8 @@ class Receiver(threading.Thread):
                     if "w" in info and "h" in info:
                         self.size = (int(info["w"]), int(info["h"]))
                     self.device_name = info.get("name", "iPhone")
+                    if info.get("pt_w") and info.get("pt_h"):
+                        self.points = (float(info["pt_w"]), float(info["pt_h"]))
                     if "w" in info:
                         self.status = f"Streaming from {self.device_name}"
                     # Send our tuning settings (first hello of a session only).
@@ -394,6 +397,7 @@ class Receiver(threading.Thread):
 import numpy as np  # noqa: E402  (PyAV already depends on it)
 
 from helper import ControlHelper  # noqa: E402
+from btcontrol import BtControl, BtInput  # noqa: E402
 
 TOP_BAR = 34          # strip above the phone picture for the Home / App Switcher buttons (like macOS)
 
@@ -621,6 +625,8 @@ def main() -> None:
     rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
     rx.start()
     helper = ControlHelper()
+    use_bt = load_settings().get("control", "bluetooth") != "helper"
+    bt = BtControl() if use_bt else None
     auto_tried_for = 0.0
     go_home_after_launch = False   # WDA's blank screen comes to the front when it starts
 
@@ -629,7 +635,7 @@ def main() -> None:
         if not notes or notes[-1][0] != msg:
             notes.append((msg, time.time() + 3))
 
-    ctl = InputController(rx, note)
+    ctl = BtInput(bt, note) if use_bt else InputController(rx, note)
     show_stats = True
     fullscreen = False
     manual_rot = 0
@@ -641,13 +647,14 @@ def main() -> None:
     last_draw = 0.0
     max_frames = int(os.environ.get("MIRRORLINK_EXIT_AFTER_FRAMES", "0"))  # for automated tests
 
-    cfg_cache = {"mtime": None, "map": {}}
+    cfg_cache = {"mtime": None, "map": {}, "all": {}}
 
     def current_rotation() -> int:
         m = settings_mtime()
         if m != cfg_cache["mtime"]:                   # re-read settings.json only when saved
             cfg_cache["mtime"] = m
-            cfg_cache["map"] = load_settings().get("orientation_map", {})
+            cfg_cache["all"] = load_settings()
+            cfg_cache["map"] = cfg_cache["all"].get("orientation_map", {})
         return (rotation_for(rx.orientation_raw, cfg_cache["map"]) + manual_rot) % 360
 
     def image_area() -> tuple[int, int, int, int]:
@@ -712,6 +719,10 @@ def main() -> None:
                     t = clipboard_text()
                     if t:
                         ctl.type_text(t.replace("\r\n", "\n"))
+                elif ctrl and ev.key == pygame.K_k:
+                    if use_bt:
+                        ctl.key("keyboard")
+                        note("Showing / hiding the iPhone's on-screen keyboard")
                 elif ctrl and ev.key == pygame.K_r:
                     manual_rot = (manual_rot + 90) % 360
                     sized_for = None
@@ -724,6 +735,9 @@ def main() -> None:
                     win_scale = 1.0; sized_for = None
                 elif ev.key == pygame.K_F1:
                     show_stats = not show_stats
+                elif ev.key == pygame.K_F5 and use_bt:
+                    bt.restart()
+                    note("Restarting Bluetooth control…")
                 elif ev.key == pygame.K_F5:
                     if rx.link_kind != "usb":
                         note("Plug in the USB cable to start the control helper")
@@ -737,6 +751,12 @@ def main() -> None:
                     last_surface = None
                 elif ev.key == pygame.K_r and rx.kicked and not ctrl:
                     rx.resume.set()
+                elif ctrl and use_bt and not rx.kicked:
+                    # other Ctrl+letter = Cmd+letter on the iPhone (Ctrl+A select all, Ctrl+Z undo...)
+                    ctl.command(pygame.key.name(ev.key), bool(ev.mod & pygame.KMOD_SHIFT))
+                elif not ctrl and use_bt:
+                    if not rx.kicked:
+                        ctl.key_down(ev.key, pygame.key.name(ev.key), bool(ev.mod & pygame.KMOD_SHIFT))
                 elif not ctrl:
                     if ev.key == pygame.K_BACKSPACE:
                         ctl.type_text("\b")
@@ -744,6 +764,8 @@ def main() -> None:
                         ctl.type_text("\n")
                     elif ev.key == pygame.K_TAB:
                         ctl.type_text("\t")
+            elif ev.type == pygame.KEYUP and use_bt:
+                ctl.key_up(ev.key)
             elif ev.type == pygame.TEXTINPUT:
                 if not rx.kicked:
                     ctl.type_text(ev.text)
@@ -774,6 +796,10 @@ def main() -> None:
                     x, y, w, h = last_rect
                     if w and h:
                         ctl.motion(min(1, max(0, (ev.pos[0] - x) / w)), min(1, max(0, (ev.pos[1] - y) / h)))
+                elif use_bt:
+                    p = to_norm(ev.pos)
+                    if p:
+                        ctl.hover(*p)
                 dirty = True                         # hover bar / home pill
             elif ev.type == pygame.MOUSEWHEEL:
                 p = to_norm(pygame.mouse.get_pos())
@@ -790,7 +816,7 @@ def main() -> None:
         ctl.tick()
 
         # Start the control helper automatically (USB only, once per connection).
-        if (rx.connected and rx.link_kind == "usb" and not rx.control_ready and not helper.busy
+        if (not use_bt and rx.connected and rx.link_kind == "usb" and not rx.control_ready and not helper.busy
                 and rx.connected_at != auto_tried_for and time.time() - rx.connected_at > 4):
             auto_tried_for = rx.connected_at
             helper.start("auto")
@@ -804,6 +830,11 @@ def main() -> None:
 
         # Resize the window to the phone's real aspect ratio / orientation.
         rot = current_rotation()
+        if use_bt:
+            pts = rx.points
+            if pts is None and rx.size:            # older phone app: estimate from the picture
+                pts = (402.0, 402.0 * rx.size[1] / max(1, rx.size[0]))
+            ctl.configure(rot, pts, cfg_cache["all"])
         if rx.size and (rx.size, rot, win_scale) != sized_for and not fullscreen:
             set_window(window_size_for(rx.size[0], rx.size[1], rot))
             sized_for = (rx.size, rot, win_scale)
@@ -881,7 +912,9 @@ def main() -> None:
         if show_stats:
             s = stats.snapshot
             rtt = f"{s['rtt_ms']:.1f} ms" if s["rtt_ms"] is not None else "–"
-            if rx.control_ready:
+            if use_bt:
+                control = bt.status_line()
+            elif rx.control_ready:
                 control = "Control: ready"
             elif helper.status:
                 control = helper.status
@@ -899,7 +932,8 @@ def main() -> None:
                 f" · orientation {rx.orientation_raw if rx.orientation_raw is not None else '–'} ({rot}°)",
                 control,
                 *([rx.status_note] if time.time() < rx.note_until else []),
-                "F1 stats · F5 start control · F11 fullscreen · Ctrl+R rotate · Ctrl+Q quit",
+                ("F1 stats · F5 restart control · F11 fullscreen · Ctrl+K phone keyboard · Ctrl+R rotate · Ctrl+Q quit"
+                 if use_bt else "F1 stats · F5 start control · F11 fullscreen · Ctrl+R rotate · Ctrl+Q quit"),
             ]
             pad = 7
             surfs = [font.render(t, True, (235, 235, 240)) for t in lines]
@@ -933,6 +967,8 @@ def main() -> None:
     snap = os.environ.get("MIRRORLINK_SNAPSHOT")   # for automated tests
     if snap:
         pygame.image.save(screen, snap)
+    if bt is not None:
+        bt.close()
     rx.stop()
     pygame.quit()
 
