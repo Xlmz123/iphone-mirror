@@ -6,8 +6,7 @@ nothing extra on the phone, no Developer Mode. iOS drives the mouse through Assi
 
 mirror.py starts this as its own process on Python 3.13 through uv, because the Windows
 Runtime bindings (winrt) aren't built for newer Pythons yet. Only the viewer talks to it,
-over 127.0.0.1 with a token. It stops by itself a few seconds after the viewer closes, so
-the iPhone gets its on-screen keyboard back.
+over 127.0.0.1 with a token.
 
 Credits: the HID report descriptor, the GATT layout and the iOS behaviour this relies on
 were measured and published by phoneuse (https://github.com/lxe/phoneuse), MIT License,
@@ -22,6 +21,12 @@ Copyright (c) 2026 Aleksey Smolenchuk. What they found:
   * After relative moves, iOS ignores an absolute report at the same spot as the previous
     absolute report (Nudge works around it).
 
+It keeps running after the viewer closes (until Windows restarts). That's on purpose:
+every time the service starts, the iPhone sees the Bluetooth services disappear and come
+back, and iOS can then keep a stale copy and ignore the keyboard and mouse until it's paired
+again (phoneuse saw this; so did we). When the viewer closes, the iPhone gets its on-screen
+keyboard back (Eject) and the pointer is left alone.
+
 Commands, one per line after "auth <token>". Positions are fractions of the screen (0..1)
 as the viewer shows it:
   screen W H             the phone's screen in points (same orientation as the positions)
@@ -34,9 +39,8 @@ as the viewer shows it:
   key CODE MODS          press and release a key (HID usage, modifier bits)
   kdown CODE MODS | kup CODE   hold / release a key (iOS repeats held keys itself)
   text "json string"     type text (US keyboard layout)
-  consumer NAME          home, search, eject (shows/hides the on-screen keyboard),
-                         volup, voldown, playpause, mute
-  restart | bye          start over | the viewer is closing
+  consumer NAME          home, search, siri, eject (shows/hides the on-screen keyboard)
+  restart | bye          start over (the iPhone may need pairing again) | the viewer is closing
 The service answers with "status {json}" lines (on change, and every few seconds).
 
 Run by hand for testing:  python blehid.py --fake   (no Bluetooth: logs the reports)
@@ -57,6 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
+VERSION = 3          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -101,19 +106,17 @@ REPORT_MAP = bytes.fromhex(
     # Report 3: absolute pointer (buttons, X and Y 0..32767): lands the pointer exactly.
     "05010902a10185030901a1000509190129031500250195037501810295017505810305010930093115002"
     "6ff7f751095028102c0c0"
-    # Report 4: consumer keys, one bit each (CONSUMER_BITS order), 1 bit padding.
+    # Report 4: consumer keys, one bit each (CONSUMER_BITS order), 4 bits padding.
+    # Exactly phoneuse's descriptor, which is known to work with iOS.
     "050c0901a10185041500250175019501"
     "09b88102"     # Eject: shows / hides the on-screen keyboard
+    "09cf8102"     # Voice Command: Siri
     "09408102"     # Menu: Home
     "0a21028102"   # AC Search: Spotlight
-    "09e98102"     # Volume Up
-    "09ea8102"     # Volume Down
-    "09cd8102"     # Play/Pause
-    "09e28102"     # Mute
-    "95018103c0"
+    "95048103c0"
 )
 REPORT_SIZES = {1: 8, 2: 4, 3: 5, 4: 1}
-CONSUMER_BITS = {"eject": 0, "home": 1, "search": 2, "volup": 3, "voldown": 4, "playpause": 5, "mute": 6}
+CONSUMER_BITS = {"eject": 0, "siri": 1, "home": 2, "search": 3}
 
 # US keyboard layout: character -> (usage, modifiers)
 CHARS: dict[str, tuple[int, int]] = {}
@@ -951,8 +954,8 @@ class Service:
         self.started = time.monotonic()
         self.last_client = time.monotonic()
         self.had_client = False
-        self.bye = False
         self.restart = False
+        self.showed_keyboard = False     # we sent Eject when the viewer left: hide it again when it's back
         self.last_status = None
         self.last_status_t = 0.0
 
@@ -960,7 +963,8 @@ class Service:
         return {"published": bool(self.hid.published), "connected": bool(self.hid.connected),
                 "phone": self.hid.phone, "problem": self.hid.problem,
                 "pc": os.environ.get("COMPUTERNAME", "this PC"),
-                "interval_ms": self.hid.interval_ms, "skipped_chars": self.engine.skipped_chars}
+                "interval_ms": self.hid.interval_ms, "skipped_chars": self.engine.skipped_chars,
+                "version": VERSION}
 
     def push_status(self, force: bool = False) -> None:
         s = self.status()
@@ -983,14 +987,20 @@ class Service:
             writer.close()
             return
         if self.writer is not None:            # a newer viewer replaces an older one
+            old = self.writer
+            self.writer = None
             try:
-                self.writer.close()
-            except OSError:
+                old.write(b"kicked\n")
+                old.close()
+            except (OSError, RuntimeError):
                 pass
+            log("another viewer took over")
         self.writer = writer
         self.had_client = True
-        self.bye = False
         log("viewer connected")
+        if self.showed_keyboard:
+            self.showed_keyboard = False
+            self.engine.push(("consumer", "eject"))      # a keyboard again: hide the on-screen one
         self.push_status(force=True)
         try:
             while True:
@@ -1008,6 +1018,9 @@ class Service:
                 self.writer = None
                 self.last_client = time.monotonic()
                 self.engine.push(("reset",))
+                if self.hid.connected:
+                    self.showed_keyboard = True
+                    self.engine.push(("consumer", "eject"))   # give the iPhone its on-screen keyboard back
                 log("viewer disconnected")
             try:
                 writer.close()
@@ -1044,6 +1057,8 @@ class Service:
             if isinstance(s, str) and s:
                 e.push(("text", s[:5000]))
         elif cmd == "consumer":
+            if a[0] == "eject":
+                self.showed_keyboard = False        # the user toggles it by hand: don't undo that
             e.push(("consumer", a[0]))
         elif cmd == "screen":
             w, h = f(0), f(1)
@@ -1058,27 +1073,21 @@ class Service:
         elif cmd == "status":
             self.push_status(force=True)
         elif cmd == "bye":
-            self.bye = True
+            pass                                  # the disconnect that follows does the rest
         elif cmd == "restart":
             self.restart = True
         else:
             log("unknown command:", cmd)
 
     async def watchdog(self) -> None:
-        """Status to the viewer; stop when the viewer is gone (so the iPhone gets its
-        on-screen keyboard back)."""
+        """Status to the viewer. Keeps running without a viewer (see the top of the file)."""
         while True:
             await asyncio.sleep(0.5)
             self.push_status()
-            idle = time.monotonic() - self.last_client
             if self.restart:
                 log("restart requested")
+                await asyncio.sleep(0.3)
                 self.quit()
-            if self.writer is None:
-                if (self.had_client and idle > (1.5 if self.bye else 10)) or \
-                        (not self.had_client and time.monotonic() - self.started > 180):
-                    log("no viewer: stopping")
-                    self.quit()
 
     def quit(self) -> None:
         try:
