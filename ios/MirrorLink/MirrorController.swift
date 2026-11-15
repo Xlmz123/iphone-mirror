@@ -99,12 +99,8 @@ final class MirrorController: NSObject, ObservableObject {
     }
 
     fileprivate func pickerReturned(filter: SCContentFilter, existingStream: SCStream?) {
-        if existingStream != nil || engine.isCapturing {
-            engine.update(filter: filter)
-            return
-        }
         let size = UIScreen.main.nativeBounds.size
-        engine.start(filter: filter, pixelSize: size) { [weak self] error in
+        engine.restart(filter: filter, pixelSize: size) { [weak self] error in
             Task { @MainActor in
                 guard let self else { return }
                 if let error {
