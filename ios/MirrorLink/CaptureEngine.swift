@@ -219,7 +219,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lock.unlock()
             if let buf, sending {
                 self.lastEncodeTime = CACurrentMediaTime()
-                self.encoder.encode(buf, pts: self.hostTime())
+                self.encoder.encode(buf, pts: self.hostTime(), forceKey: true)
             }
         }
     }

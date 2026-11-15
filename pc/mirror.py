@@ -112,6 +112,7 @@ class Receiver(threading.Thread):
         self.pairing = pairing_store.load()
         self.status_note = ""
         self.note_until = 0.0
+        self.count = {"key": 0, "delta": 0, "frames": 0, "errors": 0}   # totals this session
 
     @property
     def connected(self) -> bool:
@@ -211,6 +212,7 @@ class Receiver(threading.Thread):
     # ---- streaming ----------------------------------------------------------
 
     def _session(self, link: PlainLink) -> None:
+        self.count = {"key": 0, "delta": 0, "frames": 0, "errors": 0}
         codec = av.CodecContext.create("h264", "r")
         codec.options = {"flags": "low_delay"}   # output each frame immediately
         codec.thread_type = "SLICE"              # frame threading would add latency
@@ -256,6 +258,7 @@ class Receiver(threading.Thread):
                 if mtype in (MSG_KEY, MSG_DELTA):
                     # Acknowledge on arrival: tells the phone the link is keeping up.
                     send_msg(link, MSG_ACK, struct.pack(">Q", ts))
+                    self.count["key" if mtype == MSG_KEY else "delta"] += 1
                     if waiting_for_key and mtype != MSG_KEY:
                         continue
                     waiting_for_key = False
@@ -263,6 +266,7 @@ class Receiver(threading.Thread):
                     try:
                         frames = codec.decode(av.Packet(payload))
                     except av.error.FFmpegError:
+                        self.count["errors"] += 1
                         waiting_for_key = True          # ask for a clean restart point
                         send_msg(link, MSG_REQ_KEY)
                         continue
@@ -271,6 +275,7 @@ class Receiver(threading.Thread):
                         self.stats.rx_frames += 1
                         self.stats.rx_bytes += length
                         self.stats.decode_ms = self.stats.decode_ms * 0.9 + dt * 0.1
+                    self.count["frames"] += len(frames)
                     if frames:
                         if self.size is None:
                             self.size = (frames[-1].width, frames[-1].height)
@@ -431,6 +436,8 @@ def main() -> None:
                 f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps",
                 f"decode {s['decode_ms']:.1f} ms · round trip {rtt}"
                 f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}",
+                f"received {rx.count['key']} key + {rx.count['delta']} other · "
+                f"decoded {rx.count['frames']} · errors {rx.count['errors']}",
                 *([rx.status_note] if time.time() < rx.note_until else []),
                 "F1 stats · F11 fullscreen · Esc quit",
             ]
