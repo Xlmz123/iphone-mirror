@@ -21,9 +21,11 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private let jpeg = JPEGEncoder()
     private var jpegMode = false
     private var hwFailStreak = 0
-    private let jpegMaxFPS: Double = 20
+    private var lastOrientation = ""               // capture-queue only
+    let input = InputBridge()
     var onLog: ((String) -> Void)?
     var onMode: ((Bool) -> Void)?      // true = JPEG fallback active
+    var onControlReady: ((Bool) -> Void)?
 
     /// Speed/quality settings. Defaults here; the PC can change them live by
     /// sending pc/settings.json (see apply(config:)).
@@ -37,6 +39,10 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         var queuedUSB = 4
         var queuedWiFi = 6
         var keyframeInterval = 3.0
+        /// Background (JPEG) mode. Encoding is on the CPU, so the real rate may be
+        /// lower than this on older iPhones; frames are simply skipped.
+        var jpegMaxFPS = 60.0
+        var jpegQuality = 0.6
     }
     private var tuning = Tuning()                    // guarded by lock
     private var currentLink: LinkType?               // guarded by lock
@@ -63,6 +69,12 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         server.onKeyframeRequested = { [weak self] in self?.keyframeRequested() }
         server.onConfig = { [weak self] cfg in self?.apply(config: cfg) }
+        server.onInput = { [weak self] m in self?.input.handle(m) }
+        input.onStatus = { [weak self] st in
+            self?.server.sendInputStatus(st)
+            self?.onControlReady?(st["ready"] as? Bool ?? false)
+        }
+        input.onLog = { [weak self] msg in self?.onLog?(msg) }
         server.onClientConnected = { [weak self] link in
             guard let self else { return }
             self.lock.lock()
@@ -71,9 +83,11 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lock.unlock()
             self.encoder.setBitrateFactor(link == .wifi ? t.bitrateWiFi : t.bitrateUSB)
             self.setClientConnected(true)
+            self.input.start()
             self.onClientChanged?(link)
         }
         server.onClientDisconnected = { [weak self] in
+            self?.input.stop()
             self?.setClientConnected(false)
             self?.onClientChanged?(nil)
         }
@@ -158,6 +172,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         if let v = num("max_queued_frames_usb") { tuning.queuedUSB = Int(clamp(v, 1, 30)) }
         if let v = num("max_queued_frames_wifi") { tuning.queuedWiFi = Int(clamp(v, 1, 30)) }
         if let v = num("keyframe_interval_s") { tuning.keyframeInterval = clamp(v, 1, 10) }
+        if let v = num("jpeg_max_fps") { tuning.jpegMaxFPS = clamp(v, 5, 60) }
+        if let v = num("jpeg_quality") { tuning.jpegQuality = clamp(v, 0.2, 0.95) }
         let t = tuning
         let link = currentLink
         lock.unlock()
@@ -196,13 +212,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         let sending = clientConnected
         lock.unlock()
 
+        reportOrientation(sampleBuffer)
+
         guard sending else { return }       // nobody watching: don't burn battery encoding
 
         // Cap at 60 fps. 120 Hz iPhones can deliver twice that, which doubles the
         // work for no benefit on a 60 Hz PC monitor.
-        lock.lock(); let maxFPS = tuning.maxFPS; lock.unlock()
+        lock.lock(); let maxFPS = tuning.maxFPS; let jpegFPS = tuning.jpegMaxFPS; lock.unlock()
         let now = CACurrentMediaTime()
-        let fpsCap = jpegMode ? min(maxFPS, jpegMaxFPS) : maxFPS
+        let fpsCap = jpegMode ? min(maxFPS, jpegFPS) : maxFPS
         guard now - lastEncodeTime >= 1.0 / (fpsCap + 2) else { return }
         lastEncodeTime = now
 
@@ -255,8 +273,24 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// iOS 27 tags each frame with the screen's orientation. The pixels themselves
+    /// stay in the phone's native portrait layout, so the PC rotates the picture.
+    private func reportOrientation(_ sampleBuffer: CMSampleBuffer) {
+        guard let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
+              let info = arr.first,
+              let value = info[SCStreamFrameInfo.videoOrientation.rawValue] else { return }
+        let raw: Any = (value as? NSNumber) ?? String(describing: value)
+        let key = String(describing: raw)
+        guard key != lastOrientation else { return }
+        lastOrientation = key
+        server.sendOrientation(["o": raw])
+        input.invalidateWindowSize()
+        onLog?("Orientation changed (raw \(key))")
+    }
+
     private func sendJPEG(_ pixelBuffer: CVPixelBuffer) {
-        guard let data = jpeg.encode(pixelBuffer) else { return }
+        lock.lock(); let q = tuning.jpegQuality; lock.unlock()
+        guard let data = jpeg.encode(pixelBuffer, quality: CGFloat(q)) else { return }
         server.sendJPEG(data, timestampUs: Wire.nowUs())
     }
 

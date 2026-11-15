@@ -54,6 +54,8 @@ jobs:
           # libraries so the phone's own (from the developer disk image) are used.
           # This is required to launch it as a normal process on iOS 17+.
           rm -rf Payload/WebDriverAgentRunner-Runner.app/Frameworks/*
+          # Debug symbols aren't needed on the phone and can confuse re-signing.
+          find Payload -name "*.dSYM" -prune -exec rm -rf {} +
           plutil -p Payload/WebDriverAgentRunner-Runner.app/Info.plist | grep -E "CFBundleIdentifier|MinimumOSVersion"
           ls Payload/WebDriverAgentRunner-Runner.app/PlugIns/
           zip -qry WebDriverAgent-unsigned.ipa Payload

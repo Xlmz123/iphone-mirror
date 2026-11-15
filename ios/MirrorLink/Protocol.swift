@@ -16,6 +16,9 @@ enum MsgType: UInt8 {
     case videoKey   = 0x02   // H.264 Annex-B access unit (keyframe, includes SPS/PPS)
     case videoDelta = 0x03   // H.264 Annex-B access unit
     case jpegFrame  = 0x04   // complete JPEG picture (background fallback)
+    case orientation = 0x05  // JSON: {"o": raw SCStreamFrameInfo.videoOrientation value}
+    case kicked     = 0x22   // another viewer connected and took over; don't auto-reconnect
+    case inputStatus = 0x31  // JSON: {"ready": Bool, "detail": String} (control helper state)
     case pairInfo   = 0x21   // JSON: {"id":hex,"key":base64,"name":".."}  (USB only)
     // PC -> phone
     case requestKeyframe = 0x10
@@ -24,6 +27,7 @@ enum MsgType: UInt8 {
     case ack             = 0x13  // payload: 8-byte timestamp of the video frame received
     case config          = 0x14  // JSON tuning settings from pc/settings.json (see CaptureEngine.apply)
     case pairRequest     = 0x20  // USB only
+    case input           = 0x30  // JSON input event (see InputBridge)
 }
 
 enum Wire {

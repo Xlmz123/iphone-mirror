@@ -22,6 +22,9 @@ final class StreamServer {
     var onWifiStatus: ((String) -> Void)?
     var onPaired: (() -> Void)?
     var onConfig: (([String: Any]) -> Void)?
+    var onInput: (([String: Any]) -> Void)?
+    private var lastOrientation: Data?
+    private var lastInputStatus: Data?
 
     private let queue = DispatchQueue(label: "mirrorlink.net", qos: .userInteractive)
     private var usbListener: NWListener?
@@ -224,7 +227,12 @@ final class StreamServer {
         pending.removeValue(forKey: ObjectIdentifier(s))
         let old = active
         active = s                      // set first so the old one's teardown is ignored
-        old?.conn.cancel()
+        if let old {
+            // Tell the replaced viewer why, so it stops reconnecting instead of
+            // fighting the new one; then close it.
+            transmit(old, Wire.frame(.kicked, timestampUs: Wire.nowUs(), payload: Data()))
+            queue.asyncAfter(deadline: .now() + 0.3) { old.conn.cancel() }
+        }
         outstanding.removeAll()
         dropping = true                 // nothing useful until a keyframe
         keyAskedWhileDropping = true
@@ -236,8 +244,32 @@ final class StreamServer {
         if let data = try? JSONSerialization.data(withJSONObject: hello) {
             transmit(s, Wire.frame(.hello, timestampUs: Wire.nowUs(), payload: data))
         }
+        if let o = lastOrientation {
+            transmit(s, Wire.frame(.orientation, timestampUs: Wire.nowUs(), payload: o))
+        }
+        if let st = lastInputStatus {
+            transmit(s, Wire.frame(.inputStatus, timestampUs: Wire.nowUs(), payload: st))
+        }
         onClientConnected?(s.link)
         onKeyframeRequested?()
+    }
+
+    /// Picture orientation as reported by ScreenCaptureKit (sent when it changes).
+    func sendOrientation(_ json: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
+        queue.async {
+            self.lastOrientation = data
+            if let s = self.active { self.transmit(s, Wire.frame(.orientation, timestampUs: Wire.nowUs(), payload: data)) }
+        }
+    }
+
+    /// Control helper (WDA) status for the PC.
+    func sendInputStatus(_ json: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
+        queue.async {
+            self.lastInputStatus = data
+            if let s = self.active { self.transmit(s, Wire.frame(.inputStatus, timestampUs: Wire.nowUs(), payload: data)) }
+        }
     }
 
     private func close(_ s: Session) {
@@ -421,6 +453,10 @@ final class StreamServer {
             let ts = Wire.readUInt64BE(payload)
             outstanding.removeAll { $0 <= ts }
             maybeRequestKeyframe(limit: s.link == .usb ? maxOutstandingUSB : maxOutstandingWiFi)
+        case .input:
+            guard s === active,
+                  let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return }
+            onInput?(obj)
         case .config:
             guard s === active,
                   let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { return }

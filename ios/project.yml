@@ -37,6 +37,9 @@ targets:
           - screen-capture
           - audio          # silent-audio keep-alive (KeepAlive.swift)
         NSScreenCaptureUsageDescription: MirrorLink shows your screen on your paired PC.
+        # Lets the app talk to the control helper (WebDriverAgent) over loopback HTTP.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         # Wi-Fi mirroring: lets the PC find this iPhone on the local network.
         NSBonjourServices:
           - _mirrorlink._tcp

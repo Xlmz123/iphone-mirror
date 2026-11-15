@@ -6,7 +6,9 @@
   "max_queued_frames_usb": 4,
   "max_queued_frames_wifi": 6,
   "keyframe_interval_s": 3,
-
+  "jpeg_max_fps": 60,
+  "jpeg_quality": 0.6,
+  "orientation_map": {},
   "_help": {
     "max_height": "Stream height in pixels (480-3000). Lower = less lag and less phone load. ~1000-1400 matches a laptop screen.",
     "max_fps": "Frame rate cap (5-120). 60 matches most monitors.",
@@ -14,6 +16,9 @@
     "bitrate_wifi": "Same, over Wi-Fi. Lower it if Wi-Fi stutters.",
     "max_queued_frames_usb": "How many frames may be in flight before the phone skips frames to stay current. Lower = less lag, more skipping.",
     "max_queued_frames_wifi": "Same, over Wi-Fi (needs a bit more slack for Wi-Fi hiccups).",
-    "keyframe_interval_s": "Seconds between full refresh frames (1-10). Lower heals glitches faster but uses more data."
+    "keyframe_interval_s": "Seconds between full refresh frames (1-10). Lower heals glitches faster but uses more data.",
+    "jpeg_max_fps": "Frame-rate cap while the MirrorLink app is in the background (JPEG mode, CPU-encoded), 5-60. Older iPhones may run lower.",
+    "jpeg_quality": "JPEG quality in background mode (0.2-0.95). Lower = smoother on slow links.",
+    "orientation_map": "Only if landscape shows sideways: map the phone's orientation value (shown in F1 stats) to degrees, e.g. {\"6\": 270}. Ctrl+R also rotates by hand."
   }
 }
