@@ -40,6 +40,9 @@ struct ContentView: View {
                     row("Capture", c.isCapturing ? "Sharing screen" : "Off", ok: c.isCapturing)
                     if c.isCapturing && c.link != nil {
                         row("Frames", "\(c.fps) fps · \(c.skipped) skipped · \(c.keyframes) key", ok: c.fps > 0)
+                        if c.jpegMode {
+                            row("Mode", "JPEG (background)", ok: true)
+                        }
                     }
                 }
                 .padding()

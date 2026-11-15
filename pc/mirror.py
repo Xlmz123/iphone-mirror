@@ -37,7 +37,7 @@ USB_PORT = 47800
 WIFI_PORT = 47801
 HEADER = struct.Struct(">IBQ")   # length, type, timestamp(us)
 
-MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_PAIR_INFO = 0x01, 0x02, 0x03, 0x21
+MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_JPEG, MSG_PAIR_INFO = 0x01, 0x02, 0x03, 0x04, 0x21
 MSG_REQ_KEY, MSG_PING, MSG_PONG, MSG_ACK, MSG_CONFIG, MSG_PAIR_REQ = 0x10, 0x11, 0x12, 0x13, 0x14, 0x20
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -112,7 +112,8 @@ class Receiver(threading.Thread):
         self.pairing = pairing_store.load()
         self.status_note = ""
         self.note_until = 0.0
-        self.count = {"key": 0, "delta": 0, "frames": 0, "errors": 0}   # totals this session
+        self.count = {"key": 0, "delta": 0, "jpeg": 0, "frames": 0, "errors": 0}   # totals this session
+        self.mode = "H.264"
 
     @property
     def connected(self) -> bool:
@@ -212,7 +213,8 @@ class Receiver(threading.Thread):
     # ---- streaming ----------------------------------------------------------
 
     def _session(self, link: PlainLink) -> None:
-        self.count = {"key": 0, "delta": 0, "frames": 0, "errors": 0}
+        self.count = {"key": 0, "delta": 0, "jpeg": 0, "frames": 0, "errors": 0}
+        jpeg_codec = None   # created on first JPEG frame (phone's background fallback)
         codec = av.CodecContext.create("h264", "r")
         codec.options = {"flags": "low_delay"}   # output each frame immediately
         codec.thread_type = "SLICE"              # frame threading would add latency
@@ -255,7 +257,34 @@ class Receiver(threading.Thread):
                 length, mtype, ts = HEADER.unpack(link.read_exact(HEADER.size))
                 payload = link.read_exact(length)
 
+                if mtype == MSG_JPEG:
+                    # Phone is in the background: iOS blocks its hardware video encoder,
+                    # so it sends standalone JPEG pictures instead.
+                    send_msg(link, MSG_ACK, struct.pack(">Q", ts))
+                    self.count["jpeg"] += 1
+                    self.mode = "JPEG (phone app in background)"
+                    if jpeg_codec is None:
+                        jpeg_codec = av.CodecContext.create("mjpeg", "r")
+                    t0 = time.perf_counter()
+                    try:
+                        frames = jpeg_codec.decode(av.Packet(payload))
+                    except av.error.FFmpegError:
+                        self.count["errors"] += 1
+                        continue
+                    dt = (time.perf_counter() - t0) * 1000
+                    with self.stats.lock:
+                        self.stats.rx_frames += 1
+                        self.stats.rx_bytes += length
+                        self.stats.decode_ms = self.stats.decode_ms * 0.9 + dt * 0.1
+                    self.count["frames"] += len(frames)
+                    if frames:
+                        with self._lock:
+                            self._latest = frames[-1]
+                        self.new_frame.set()
+                    continue
+
                 if mtype in (MSG_KEY, MSG_DELTA):
+                    self.mode = "H.264"
                     # Acknowledge on arrival: tells the phone the link is keeping up.
                     send_msg(link, MSG_ACK, struct.pack(">Q", ts))
                     self.count["key" if mtype == MSG_KEY else "delta"] += 1
@@ -436,7 +465,8 @@ def main() -> None:
                 f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps",
                 f"decode {s['decode_ms']:.1f} ms · round trip {rtt}"
                 f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}",
-                f"received {rx.count['key']} key + {rx.count['delta']} other · "
+                f"mode {rx.mode} · received {rx.count['key']} key + {rx.count['delta']} other"
+                f"{' + ' + str(rx.count['jpeg']) + ' jpeg' if rx.count['jpeg'] else ''} · "
                 f"decoded {rx.count['frames']} · errors {rx.count['errors']}",
                 *([rx.status_note] if time.time() < rx.note_until else []),
                 "F1 stats · F11 fullscreen · Esc quit",

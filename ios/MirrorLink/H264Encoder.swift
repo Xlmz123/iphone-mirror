@@ -22,6 +22,8 @@ final class H264Encoder {
     private var keyframeInterval = 3.0
     private var keyIntervalDirty = false
     private var lastForcedKey: CFTimeInterval = 0
+    private var errorCount = 0            // encode failures since last takeErrorCount()
+    private var needsReset = false        // iOS invalidated the session (-12903)
     private var keyframeCount = 0
     private let lock = NSLock()
 
@@ -29,6 +31,19 @@ final class H264Encoder {
 
     func requestKeyframe() {
         lock.lock(); forceKeyframe = true; lock.unlock()
+    }
+
+    /// Encode failures since the last call (from either the submit or the callback).
+    func takeErrorCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let n = errorCount; errorCount = 0; return n
+    }
+
+    private func noteError(_ status: OSStatus) {
+        lock.lock()
+        errorCount += 1
+        if status == kVTInvalidSessionErr { needsReset = true }
+        lock.unlock()
     }
 
     /// Keyframes produced since the last call.
@@ -113,13 +128,18 @@ final class H264Encoder {
 
     /// `forceKey`: make this frame a keyframe now, ignoring the keyframe throttle.
     /// Used when the screen is static and this is the only frame that will be sent.
-    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKey: Bool = false) {
+    /// Returns false if the frame couldn't be submitted (no session / iOS refused).
+    @discardableResult
+    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKey: Bool = false) -> Bool {
+        lock.lock(); let reset = needsReset; needsReset = false; lock.unlock()
+        if reset { invalidate() }   // iOS killed the session (app switched fg/bg): rebuild it
+
         let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
         if session == nil || w != width || h != height {
-            guard makeSession(width: w, height: h) else { return }
+            guard makeSession(width: w, height: h) else { noteError(-1); return false }
         }
-        guard let session else { return }
+        guard let session else { return false }
 
         lock.lock()
         // Keyframes are big; never force more than ~3 per second, or a struggling
@@ -149,13 +169,20 @@ final class H264Encoder {
             : nil
         let ts = Wire.nowUs()
 
-        VTCompressionSessionEncodeFrame(
+        let submit = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
             duration: .invalid, frameProperties: props, infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
-            guard status == noErr, let sampleBuffer, let self else { return }
+            guard let self else { return }
+            guard status == noErr, let sampleBuffer else { self.noteError(status); return }
             self.handleOutput(sampleBuffer, timestampUs: ts)
         }
+        if submit != noErr {
+            noteError(submit)
+            if key { lock.lock(); forceKeyframe = true; lock.unlock() }   // retry the keyframe
+            return false
+        }
+        return true
     }
 
     private func handleOutput(_ sbuf: CMSampleBuffer, timestampUs: UInt64) {

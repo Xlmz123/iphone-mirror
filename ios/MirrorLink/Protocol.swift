@@ -15,6 +15,7 @@ enum MsgType: UInt8 {
     case hello      = 0x01   // JSON: {"v":2,"w":W,"h":H,"name":"..","id":"..","link":"usb"|"wifi"}
     case videoKey   = 0x02   // H.264 Annex-B access unit (keyframe, includes SPS/PPS)
     case videoDelta = 0x03   // H.264 Annex-B access unit
+    case jpegFrame  = 0x04   // complete JPEG picture (background fallback)
     case pairInfo   = 0x21   // JSON: {"id":hex,"key":base64,"name":".."}  (USB only)
     // PC -> phone
     case requestKeyframe = 0x10

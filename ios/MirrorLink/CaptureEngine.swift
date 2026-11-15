@@ -17,6 +17,13 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var frameCount = 0
     private var lastStatsTime = CACurrentMediaTime()
     private var lastEncodeTime: CFTimeInterval = 0   // capture-queue only
+    // Background fallback (capture-queue only)
+    private let jpeg = JPEGEncoder()
+    private var jpegMode = false
+    private var hwFailStreak = 0
+    private let jpegMaxFPS: Double = 20
+    var onLog: ((String) -> Void)?
+    var onMode: ((Bool) -> Void)?      // true = JPEG fallback active
 
     /// Speed/quality settings. Defaults here; the PC can change them live by
     /// sending pc/settings.json (see apply(config:)).
@@ -195,10 +202,30 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         // work for no benefit on a 60 Hz PC monitor.
         lock.lock(); let maxFPS = tuning.maxFPS; lock.unlock()
         let now = CACurrentMediaTime()
-        guard now - lastEncodeTime >= 1.0 / (maxFPS + 2) else { return }
+        let fpsCap = jpegMode ? min(maxFPS, jpegMaxFPS) : maxFPS
+        guard now - lastEncodeTime >= 1.0 / (fpsCap + 2) else { return }
         lastEncodeTime = now
 
-        encoder.encode(pixelBuffer, pts: hostTime())
+        if jpegMode {
+            sendJPEG(pixelBuffer)
+        } else {
+            let ok = encoder.encode(pixelBuffer, pts: hostTime())
+            let errors = encoder.takeErrorCount()
+            if !ok || errors > 0 {
+                // Hardware encoder rejected the frame (iOS does this when the app
+                // leaves the foreground). Rebuild it; if that keeps failing, fall back.
+                hwFailStreak += 1
+                encoder.invalidate()
+                if hwFailStreak >= 3 {
+                    jpegMode = true
+                    onMode?(true)
+                    onLog?("Video encoder blocked by iOS in background → JPEG fallback")
+                    sendJPEG(pixelBuffer)
+                }
+            } else {
+                hwFailStreak = 0
+            }
+        }
         countFrame()
     }
 
@@ -219,7 +246,30 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             self.lock.unlock()
             if let buf, sending {
                 self.lastEncodeTime = CACurrentMediaTime()
-                self.encoder.encode(buf, pts: self.hostTime(), forceKey: true)
+                if self.jpegMode {
+                    self.sendJPEG(buf)
+                } else {
+                    self.encoder.encode(buf, pts: self.hostTime(), forceKey: true)
+                }
+            }
+        }
+    }
+
+    private func sendJPEG(_ pixelBuffer: CVPixelBuffer) {
+        guard let data = jpeg.encode(pixelBuffer) else { return }
+        server.sendJPEG(data, timestampUs: Wire.nowUs())
+    }
+
+    /// Call when the app returns to the foreground: hardware video works again,
+    /// and iOS has invalidated the old encoder session anyway.
+    func appBecameActive() {
+        captureQueue.async {
+            self.encoder.invalidate()
+            self.hwFailStreak = 0
+            if self.jpegMode {
+                self.jpegMode = false
+                self.onMode?(false)
+                self.onLog?("Back to hardware video")
             }
         }
     }
