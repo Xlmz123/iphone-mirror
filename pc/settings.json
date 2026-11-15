@@ -1,4 +1,6 @@
 {
+  "video_source": "auto",
+  "cable_size": 2000,
   "control": "bluetooth",
   "bt_coordinates": "screen",
   "bt_drag_scale": 1.0,
@@ -16,6 +18,8 @@
   "orientation_map": {},
   "jpeg_max_height": 1400,
   "_help": {
+    "video_source": "\"auto\": use cable capture (the iPhone's own screen sharing over USB — no red dot, no app needed) whenever it works, otherwise the MirrorLink app. \"app\": always use the MirrorLink app. Restart the viewer after changing.",
+    "cable_size": "Cable capture only: the largest picture side in pixels the iPhone is asked for (480-4000). Restart the viewer after changing.",
     "control": "How the PC controls the phone: \"bluetooth\" (the PC acts as a Bluetooth mouse + keyboard; no overlay on the phone) or \"helper\" (the WebDriverAgent helper; shows \"Automation Running\" on the phone). Restart the viewer after changing.",
     "bt_coordinates": "Bluetooth only. \"screen\" (normal) or \"portrait\": try \"portrait\" only if clicks land in the wrong place while the phone is in landscape.",
     "bt_drag_scale": "Bluetooth only. If drags and scrolls go too far, lower this (e.g. 0.8); too short, raise it (e.g. 1.2). Depends on the iPhone's AssistiveTouch Tracking Speed.",
