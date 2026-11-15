@@ -26,6 +26,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastOrientation = ""               // capture-queue only
     let input = InputBridge()
     var onLog: ((String) -> Void)?
+    private var nextFrameDue: CFTimeInterval = 0     // capture-queue only (frame pacing)
     var onMode: ((Bool) -> Void)?      // true = JPEG fallback active
     var onControlReady: ((Bool) -> Void)?
 
@@ -125,6 +126,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         config.width = Int(pixelSize.width * scale) & ~1       // encoders want even sizes
         config.height = Int(pixelSize.height * scale) & ~1
         config.capturesAudio = false
+        // Deliver every screen refresh (up to 120 Hz); the pacing above picks the frames.
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+        config.queueDepth = 4
 
         var hello: [String: Any] = ["w": config.width, "h": config.height, "name": deviceName]
         if screenPoints.width > 0 {          // for Bluetooth control: the screen in points
@@ -235,7 +239,12 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.lock(); let maxFPS = tuning.maxFPS; let jpegFPS = tuning.jpegMaxFPS; lock.unlock()
         let now = CACurrentMediaTime()
         let fpsCap = jpegMode ? min(maxFPS, jpegFPS) : maxFPS
-        guard now - lastEncodeTime >= 1.0 / (fpsCap + 2) else { return }
+        // Keep frames on a schedule rather than "at least 1/60 s since the last one":
+        // on a 60 Hz screen frames arrive ~16.7 ms apart with a little jitter, and a
+        // strict gap check threw away every frame that came a hair early (~45 fps).
+        let interval = 1.0 / fpsCap
+        guard now >= nextFrameDue - interval * 0.3 else { return }
+        nextFrameDue = max(nextFrameDue + interval, now + interval * 0.5)
         lastEncodeTime = now
 
         if jpegMode {
