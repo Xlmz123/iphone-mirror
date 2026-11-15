@@ -1,5 +1,5 @@
 {
-  "video_source": "auto",
+  "video_source": "app",
   "cable_size": 2000,
   "control": "bluetooth",
   "bt_coordinates": "screen",
@@ -18,7 +18,7 @@
   "orientation_map": {},
   "jpeg_max_height": 1400,
   "_help": {
-    "video_source": "\"auto\": use cable capture (the iPhone's own screen sharing over USB — no red dot, no app needed) whenever it works, otherwise the MirrorLink app. \"app\": always use the MirrorLink app. Restart the viewer after changing.",
+    "video_source": "\"app\" (default): the MirrorLink app (USB or Wi-Fi). \"cable\": experimental cable capture through the libusb0 filter driver — on some PCs Apple's USB drivers plus that filter crash Windows (blue screen, WDF_VIOLATION), so it's off by default.",
     "cable_size": "Cable capture only: the largest picture side in pixels the iPhone is asked for (480-4000). Restart the viewer after changing.",
     "control": "How the PC controls the phone: \"bluetooth\" (the PC acts as a Bluetooth mouse + keyboard; no overlay on the phone) or \"helper\" (the WebDriverAgent helper; shows \"Automation Running\" on the phone). Restart the viewer after changing.",
     "bt_coordinates": "Bluetooth only. \"screen\" (normal) or \"portrait\": try \"portrait\" only if clicks land in the wrong place while the phone is in landscape.",

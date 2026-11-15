@@ -4,8 +4,8 @@ MirrorLink shows your iPhone's screen in a window on your Windows PC, and lets y
 your mouse and keyboard on it. It works roughly like **iPhone Mirroring** on a Mac.
 
 - **Video:** up to 60 fps with low lag, over a **USB cable** or your **Wi-Fi** (encrypted).
-  Over the cable it can use the iPhone's own screen sharing (the one QuickTime uses on a
-  Mac): **no red recording dot and no app needed on the phone**. See [Cable capture](#cable-capture-no-red-dot).
+  Experimental: over the cable it can use the iPhone's own screen sharing (the one QuickTime
+  uses on a Mac) with no red recording dot. See [Cable capture](#cable-capture-no-red-dot--experimental-off-by-default).
 - **Control:** your PC acts as a **Bluetooth mouse and keyboard** for the phone. No extra
   hardware is needed, as long as your PC has Bluetooth.
 - **Free.** No Mac needed, no jailbreak, and no paid Apple developer account.
@@ -113,7 +113,13 @@ with its own icon on your Desktop and in the Start menu. To pin it, open **Start
 
 ---
 
-## Cable capture (no red dot)
+## Cable capture (no red dot) — experimental, off by default
+> **Warning:** on some PCs this crashes Windows (blue screen, `WDF_VIOLATION`). Apple's USB
+> drivers and the libusb0 filter it needs don't always get along when the iPhone switches into
+> screen-sharing mode; other tools that use the same method have the same open problem. It's
+> **off by default**; only turn it on (`"video_source": "cable"`) if you accept that risk, and
+> remove the driver (iPhoneMirror → Driver → Uninstall) if you get a blue screen.
+
 When an app records the screen, iOS shows a red dot. Over the cable, MirrorLink can instead
 use the iPhone's built-in screen sharing — the feature QuickTime uses on a Mac — so there's
 **no red dot, no app to keep open on the phone, and the picture keeps up in every app**. The
@@ -204,7 +210,7 @@ Open it in Notepad, change a number, and save. Video settings apply within a sec
 
 | Setting | Default | What it does |
 |---|---|---|
-| `video_source` | `"auto"` | `"auto"` = cable capture when it works, else the MirrorLink app. `"app"` = always the app. |
+| `video_source` | `"app"` | `"app"` = the MirrorLink app. `"cable"` = experimental cable capture (can crash Windows on some PCs). |
 | `cable_size` | 2000 | Cable capture: the largest picture side the iPhone is asked for. |
 | `control` | `"bluetooth"` | `"bluetooth"`, or `"helper"` to use the [control helper](#other-way-to-control-the-control-helper) instead |
 | `bt_drag_scale` | 1.0 | Drags and scrolls go too far → lower it (0.8). Too short → raise it (1.2). |
