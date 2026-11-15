@@ -1,3 +1,5 @@
 av>=14
 pygame-ce>=2.5
 numpy>=1.26
+cryptography>=42
+zeroconf>=0.130

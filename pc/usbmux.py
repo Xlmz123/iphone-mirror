@@ -41,8 +41,8 @@ def _open_mux() -> socket.socket:
             return socket.create_connection(USBMUXD_TCP, timeout=3)
         except OSError as e:
             raise UsbmuxError(
-                "Can't reach Apple Mobile Device Service. Install the 'Apple Devices' "
-                "app from the Microsoft Store (or iTunes) and make sure it's running."
+                "Can't reach Apple Mobile Device Service. Install iTunes (the version "
+                "from apple.com, not the Microsoft Store) and plug in your iPhone."
             ) from e
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(USBMUXD_UNIX)

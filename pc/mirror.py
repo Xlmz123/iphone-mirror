@@ -1,15 +1,22 @@
-"""MirrorLink viewer — shows your iPhone's screen on your PC over USB.
+"""MirrorLink viewer — shows your iPhone's screen on your PC over USB or Wi-Fi.
 
-Run:  python mirror.py
+Run:  python mirror.py              (USB if plugged in, otherwise Wi-Fi)
+      python mirror.py --usb-only
+      python mirror.py --host 192.168.1.23   (skip auto-discovery)
+      python mirror.py --forget       (remove this PC's pairing)
 Keys: F1 = stats overlay   F11 = fullscreen   Esc = quit
 
 Design for low latency:
   * network thread decodes every packet as it arrives (H.264, no B-frames)
+  * every video frame is acknowledged on arrival, so the phone can skip frames
+    instead of building up a backlog when the link is slow
   * only the NEWEST decoded frame is kept; the window never queues frames
   * scaling to window size happens once per displayed frame, in FFmpeg
 """
 from __future__ import annotations
 
+import argparse
+import base64
 import json
 import os
 import socket
@@ -21,21 +28,21 @@ import time
 import av
 import pygame
 
+import discovery
+import pairing as pairing_store
 import usbmux
+from secure import AuthError, PlainLink, SecureLink
 
-PORT = 47800
+USB_PORT = 47800
+WIFI_PORT = 47801
 HEADER = struct.Struct(">IBQ")   # length, type, timestamp(us)
 
-MSG_HELLO, MSG_KEY, MSG_DELTA = 0x01, 0x02, 0x03
-MSG_REQ_KEY, MSG_PING, MSG_PONG = 0x10, 0x11, 0x12
+MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_PAIR_INFO = 0x01, 0x02, 0x03, 0x21
+MSG_REQ_KEY, MSG_PING, MSG_PONG, MSG_ACK, MSG_PAIR_REQ = 0x10, 0x11, 0x12, 0x13, 0x20
 
 
-_send_lock = threading.Lock()
-
-
-def send_msg(sock: socket.socket, mtype: int, payload: bytes = b"") -> None:
-    with _send_lock:   # pinger + receiver both send; keep messages whole
-        sock.sendall(HEADER.pack(len(payload), mtype, 0) + payload)
+def send_msg(link: PlainLink, mtype: int, payload: bytes = b"") -> None:
+    link.send(HEADER.pack(len(payload), mtype, 0) + payload)
 
 
 class Stats:
@@ -67,20 +74,27 @@ class Stats:
 
 
 class Receiver(threading.Thread):
-    """Connects over USB, decodes video, publishes the latest frame."""
+    """Finds the phone (USB first, then Wi-Fi), decodes video, publishes the latest frame."""
 
-    def __init__(self, stats: Stats) -> None:
+    def __init__(self, stats: Stats, host: str | None = None, usb_only: bool = False) -> None:
         super().__init__(daemon=True)
         self.stats = stats
+        self.host = host
+        self.usb_only = usb_only
         self.status = "Starting…"
         self.device_name = ""
         self.size: tuple[int, int] | None = None
-        self.connected = False
+        self.link_kind: str | None = None        # "usb" / "wifi" / None
         self._latest: av.VideoFrame | None = None
         self._lock = threading.Lock()
         self.new_frame = threading.Event()
         self._stop = threading.Event()
-        self.sock: socket.socket | None = None
+        self.link: PlainLink | None = None
+        self.pairing = pairing_store.load()
+
+    @property
+    def connected(self) -> bool:
+        return self.link_kind is not None
 
     def latest(self) -> av.VideoFrame | None:
         with self._lock:
@@ -89,93 +103,175 @@ class Receiver(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
-        if self.sock:
+        if self.link:
+            self.link.close()
+
+    # ---- connecting -------------------------------------------------------
+
+    def _try_usb(self) -> PlainLink | None:
+        try:
+            return PlainLink(usbmux.connect(USB_PORT))
+        except usbmux.UsbmuxError as e:
+            self._usb_error = str(e)
+        except OSError as e:
+            self._usb_error = f"USB service unavailable ({e.__class__.__name__})"
+        return None
+
+    def _try_wifi(self) -> PlainLink | None:
+        p = self.pairing
+        if p is None:
+            return None
+        candidates: list[tuple[str, int]] = []
+        if self.host:
+            candidates.append((self.host, WIFI_PORT))
+        else:
+            if p.last_host:
+                candidates.append((p.last_host, WIFI_PORT))
+            self.status = "Looking for your iPhone on Wi-Fi…"
+            for c in discovery.find(p.id_hex, timeout=3.0):
+                if c not in candidates:
+                    candidates.append(c)
+        for host, port in candidates:
             try:
-                self.sock.close()
+                sock = socket.create_connection((host, port), timeout=2.0)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(5.0)
+                link = SecureLink(sock, p.key, p.id_bytes)
+                sock.settimeout(None)
+                if p.last_host != host:
+                    p.last_host = host
+                    p.save()
+                return link
+            except AuthError:
+                self._wifi_error = ("This PC's pairing is out of date (pairing was reset on the phone). "
+                                    "Connect once with the USB cable.")
             except OSError:
-                pass
+                continue
+        return None
 
     def run(self) -> None:
         while not self._stop.is_set():
+            self._usb_error = self._wifi_error = None
+            self.status = "Looking for iPhone on USB…"
+            link = self._try_usb()
+            if link is None and not self.usb_only:
+                link = self._try_wifi()
+
+            if link is None:
+                if self._wifi_error:
+                    self.status = self._wifi_error
+                elif self.pairing is None or self.usb_only:
+                    self.status = self._usb_error or "Plug in your iPhone"
+                    if self.pairing is None and not self.usb_only:
+                        self.status += " — the first connection must be over USB to pair."
+                else:
+                    self.status = ("iPhone not found on USB or Wi-Fi. Open MirrorLink on the phone; "
+                                   "for Wi-Fi, both must be on the same network.")
+                self._stop.wait(1.5)
+                continue
+
+            self.link = link
+            self.link_kind = link.kind
+            self.status = ("Connected over " + ("USB" if link.kind == "usb" else "Wi-Fi") +
+                           " — tap Start Mirroring on the phone")
             try:
-                self.status = "Looking for iPhone on USB…"
-                self.sock = usbmux.connect(PORT)
-                self.connected = True
-                self.status = "Connected — waiting for video (tap Start Mirroring on the phone)"
-                self._session(self.sock)
-            except usbmux.UsbmuxError as e:
-                self.status = str(e)
-            except (OSError, ConnectionError) as e:
+                self._session(link)
+            except (OSError, ConnectionError, ValueError) as e:
                 if not self._stop.is_set():
                     self.status = f"Disconnected ({e.__class__.__name__}). Reconnecting…"
+            except Exception as e:   # e.g. InvalidTag: tampered/corrupt Wi-Fi data
+                self.status = f"Connection dropped ({e.__class__.__name__}). Reconnecting…"
             finally:
-                self.connected = False
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except OSError:
-                        pass
-                    self.sock = None
-            self._stop.wait(1.0)
+                self.link_kind = None
+                self.link = None
+                link.close()
+            self._stop.wait(0.5)
 
-    def _session(self, sock: socket.socket) -> None:
+    # ---- streaming ----------------------------------------------------------
+
+    def _session(self, link: PlainLink) -> None:
         codec = av.CodecContext.create("h264", "r")
         codec.options = {"flags": "low_delay"}   # output each frame immediately
         codec.thread_type = "SLICE"              # frame threading would add latency
         waiting_for_key = True
+        alive = threading.Event()
+        alive.set()
 
-        # Ping every second to measure the USB round trip.
-        def pinger() -> None:
-            while self.sock is sock and not self._stop.is_set():
+        def background() -> None:
+            # Ping every second (round-trip time). On Wi-Fi, also switch to USB
+            # as soon as the cable is plugged in.
+            n = 0
+            while alive.is_set() and not self._stop.is_set():
                 try:
-                    send_msg(sock, MSG_PING, struct.pack(">d", time.perf_counter()))
+                    send_msg(link, MSG_PING, struct.pack(">d", time.perf_counter()))
                 except OSError:
                     return
+                n += 1
+                if link.kind == "wifi" and n % 3 == 0 and not self.usb_only:
+                    try:
+                        if any(d["ConnectionType"] == "USB" for d in usbmux.list_devices()):
+                            self.status = "Cable detected — switching to USB…"
+                            link.close()
+                            return
+                    except Exception:
+                        pass
                 time.sleep(1.0)
-        threading.Thread(target=pinger, daemon=True).start()
+        threading.Thread(target=background, daemon=True).start()
 
-        f = sock.makefile("rb", buffering=1 << 20)
-        while not self._stop.is_set():
-            hdr = f.read(HEADER.size)
-            if len(hdr) < HEADER.size:
-                raise ConnectionError("phone closed the connection")
-            length, mtype, _ts = HEADER.unpack(hdr)
-            payload = f.read(length)
-            if len(payload) < length:
-                raise ConnectionError("phone closed the connection")
+        try:
+            while not self._stop.is_set():
+                length, mtype, ts = HEADER.unpack(link.read_exact(HEADER.size))
+                payload = link.read_exact(length)
 
-            if mtype == MSG_HELLO:
-                info = json.loads(payload)
-                self.size = (int(info["w"]), int(info["h"]))
-                self.device_name = info.get("name", "iPhone")
-                self.status = f"Streaming from {self.device_name}"
-            elif mtype == MSG_PONG:
-                (sent,) = struct.unpack(">d", payload[:8])
-                with self.stats.lock:
-                    self.stats.rtt_ms = (time.perf_counter() - sent) * 1000
-            elif mtype in (MSG_KEY, MSG_DELTA):
-                if waiting_for_key and mtype != MSG_KEY:
-                    continue
-                waiting_for_key = False
-                t0 = time.perf_counter()
-                try:
-                    frames = codec.decode(av.Packet(payload))
-                except av.error.FFmpegError:
-                    # Corrupt/missing data: ask the phone for a fresh keyframe.
-                    waiting_for_key = True
-                    send_msg(sock, MSG_REQ_KEY)
-                    continue
-                dt = (time.perf_counter() - t0) * 1000
-                with self.stats.lock:
-                    self.stats.rx_frames += 1
-                    self.stats.rx_bytes += length
-                    self.stats.decode_ms = self.stats.decode_ms * 0.9 + dt * 0.1
-                if frames:
-                    if self.size is None:
-                        self.size = (frames[-1].width, frames[-1].height)
-                    with self._lock:
-                        self._latest = frames[-1]   # older undisplayed frames are dropped
-                    self.new_frame.set()
+                if mtype in (MSG_KEY, MSG_DELTA):
+                    # Acknowledge on arrival: tells the phone the link is keeping up.
+                    send_msg(link, MSG_ACK, struct.pack(">Q", ts))
+                    if waiting_for_key and mtype != MSG_KEY:
+                        continue
+                    waiting_for_key = False
+                    t0 = time.perf_counter()
+                    try:
+                        frames = codec.decode(av.Packet(payload))
+                    except av.error.FFmpegError:
+                        waiting_for_key = True          # ask for a clean restart point
+                        send_msg(link, MSG_REQ_KEY)
+                        continue
+                    dt = (time.perf_counter() - t0) * 1000
+                    with self.stats.lock:
+                        self.stats.rx_frames += 1
+                        self.stats.rx_bytes += length
+                        self.stats.decode_ms = self.stats.decode_ms * 0.9 + dt * 0.1
+                    if frames:
+                        if self.size is None:
+                            self.size = (frames[-1].width, frames[-1].height)
+                        with self._lock:
+                            self._latest = frames[-1]   # older undisplayed frames are dropped
+                        self.new_frame.set()
+
+                elif mtype == MSG_HELLO:
+                    info = json.loads(payload)
+                    if "w" in info and "h" in info:
+                        self.size = (int(info["w"]), int(info["h"]))
+                    self.device_name = info.get("name", "iPhone")
+                    if "w" in info:
+                        self.status = f"Streaming from {self.device_name}"
+                    # Over USB: (re)pair if this PC doesn't know this phone's current key.
+                    if link.kind == "usb" and (self.pairing is None or self.pairing.id_hex != info.get("id")):
+                        send_msg(link, MSG_PAIR_REQ)
+
+                elif mtype == MSG_PAIR_INFO:
+                    info = json.loads(payload)
+                    old_host = self.pairing.last_host if self.pairing and self.pairing.id_hex == info["id"] else None
+                    self.pairing = pairing_store.Pairing(info["id"], base64.b64decode(info["key"]),
+                                                         info.get("name", "iPhone"), old_host)
+                    self.pairing.save()
+
+                elif mtype == MSG_PONG:
+                    (sent,) = struct.unpack(">d", payload[:8])
+                    with self.stats.lock:
+                        self.stats.rtt_ms = (time.perf_counter() - sent) * 1000
+        finally:
+            alive.clear()
 
 
 # ----------------------------------------------------------------------------- UI
@@ -196,6 +292,16 @@ def fit(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int, int, 
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description="Show your iPhone's screen on this PC.")
+    ap.add_argument("--host", help="phone's Wi-Fi IP address (skips auto-discovery)")
+    ap.add_argument("--usb-only", action="store_true", help="never use Wi-Fi")
+    ap.add_argument("--forget", action="store_true", help="delete this PC's pairing and exit")
+    args = ap.parse_args()
+    if args.forget:
+        pairing_store.forget()
+        print("Pairing removed. Connect over USB to pair again.")
+        return
+
     enable_dpi_awareness()
     pygame.init()
     pygame.display.set_caption("MirrorLink")
@@ -208,7 +314,7 @@ def main() -> None:
     big = pygame.font.SysFont("segoeui,arial", 20)
 
     stats = Stats()
-    rx = Receiver(stats)
+    rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
     rx.start()
 
     show_stats = True
@@ -283,7 +389,9 @@ def main() -> None:
             s = stats.snapshot
             rtt = f"{s['rtt_ms']:.1f} ms" if s["rtt_ms"] is not None else "–"
             lines = [
-                f"{rx.device_name or 'iPhone'} · {'USB' if rx.connected else 'not connected'}",
+                f"{rx.device_name or 'iPhone'} · "
+                f"{ {'usb': 'USB', 'wifi': 'Wi-Fi (encrypted)'}.get(rx.link_kind or '', 'not connected') }"
+                f"{' · paired' if rx.pairing else ''}",
                 f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps",
                 f"decode {s['decode_ms']:.1f} ms · USB round trip {rtt}",
                 "F1 stats · F11 fullscreen · Esc quit",
