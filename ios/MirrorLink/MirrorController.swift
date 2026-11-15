@@ -22,7 +22,10 @@ final class MirrorController: NSObject, ObservableObject {
         }
     }
 
+    @Published var events: [String] = []
+
     private let engine: CaptureEngine
+    private let keepAlive = KeepAlive()
 
     var pickerAvailable: Bool { SCContentSharingPicker.shared.isAvailable }
 
@@ -31,6 +34,14 @@ final class MirrorController: NSObject, ObservableObject {
         _wifiEnabled = Published(initialValue: wifi)
         engine = CaptureEngine(wifiEnabled: wifi, deviceName: UIDevice.current.name)
         super.init()
+
+        events = UserDefaults.standard.stringArray(forKey: "eventLog") ?? []
+        if UserDefaults.standard.bool(forKey: "captureActive") {
+            log("Last session ended while mirroring (app was closed by iOS or crashed)")
+            UserDefaults.standard.set(false, forKey: "captureActive")
+        }
+        log("App started")
+        keepAlive.onLog = { [weak self] msg in self?.log(msg) }
 
         engine.onServerStatus = { [weak self] msg in
             Task { @MainActor in self?.status = msg }
@@ -45,6 +56,7 @@ final class MirrorController: NSObject, ObservableObject {
             Task { @MainActor in
                 self?.link = link
                 if link == nil { self?.fps = 0 }
+                self?.log(link == nil ? "PC disconnected" : "PC connected (\(link!.rawValue))")
             }
         }
         engine.onStats = { [weak self] fps, skipped, keys in
@@ -65,7 +77,14 @@ final class MirrorController: NSObject, ObservableObject {
             Task { @MainActor in
                 self?.isCapturing = false
                 self?.fps = 0
-                if let error { self?.lastError = "Capture stopped: \(error.localizedDescription)" }
+                if let error {
+                    let e = error as NSError
+                    self?.lastError = "Capture stopped: \(error.localizedDescription)"
+                    self?.log("Capture stopped by iOS: \(e.domain) \(e.code)")
+                } else {
+                    self?.log("Capture stopped")
+                }
+                self?.captureEnded()
                 self?.deactivatePicker()
             }
         }
@@ -87,7 +106,31 @@ final class MirrorController: NSObject, ObservableObject {
         engine.stop()
         isCapturing = false
         fps = 0
+        log("Stopped mirroring")
+        captureEnded()
         deactivatePicker()
+    }
+
+    /// Short event log shown in the app (and kept across launches) for troubleshooting.
+    func log(_ msg: String) {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        events.append("\(f.string(from: Date()))  \(msg)")
+        if events.count > 8 { events.removeFirst(events.count - 8) }
+        UserDefaults.standard.set(events, forKey: "eventLog")
+    }
+
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        switch phase {
+        case .background: log("App went to background")
+        case .active: log("App in foreground")
+        default: break
+        }
+    }
+
+    private func captureEnded() {
+        keepAlive.stop()
+        UserDefaults.standard.set(false, forKey: "captureActive")
     }
 
     func resetPairing() {
@@ -111,10 +154,14 @@ final class MirrorController: NSObject, ObservableObject {
                 guard let self else { return }
                 if let error {
                     self.lastError = "Couldn't start capture: \(error.localizedDescription)"
+                    self.log("Capture failed to start: \((error as NSError).code)")
                     self.isCapturing = false
                     self.deactivatePicker()
                 } else {
                     self.isCapturing = true
+                    self.log("Capture started")
+                    self.keepAlive.start()
+                    UserDefaults.standard.set(true, forKey: "captureActive")
                 }
             }
         }
