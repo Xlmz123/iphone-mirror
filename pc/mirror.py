@@ -406,7 +406,7 @@ TOP_BAR = 34          # strip above the phone picture for the Home / App Switche
 # 1 = upright, 3 = upside down, 6 = needs 90° clockwise, 8 = needs 90° counter-clockwise.
 # Override in settings.json with "orientation_map": {"<value>": degrees} if needed,
 # or press Ctrl+R to rotate by hand.
-DEFAULT_ORIENTATION_MAP = {"1": 0, "2": 0, "3": 180, "4": 180, "5": 90, "6": 90, "7": 270, "8": 270}
+DEFAULT_ORIENTATION_MAP = {"1": 0, "2": 0, "3": 180, "4": 180, "5": 270, "6": 270, "7": 90, "8": 90}
 
 
 def enable_dpi_awareness() -> None:
@@ -974,11 +974,16 @@ def main() -> None:
             screen.blit(t, r)
         pr = bt.pairing if use_bt else None
         if pr:
-            lines = [(big, f"Pair with {(pr.get('phone') or 'iPhone')[:22]}?", (255, 255, 255)),
-                     (big, f"Code: {pr['pin']}" if pr.get("pin") else "", (120, 220, 255)),
-                     (font, "Same code on the iPhone?", (220, 220, 225)),
-                     (font, "Tap Pair there, then press Enter here.", (220, 220, 225)),
-                     (font, "Esc = cancel", (160, 160, 170))]
+            if pr.get("pin"):
+                lines = [(big, f"Pair with {(pr.get('phone') or 'iPhone')[:22]}?", (255, 255, 255)),
+                         (big, f"Code: {pr['pin']}", (120, 220, 255)),
+                         (font, "Same code on the iPhone?", (220, 220, 225)),
+                         (font, "Tap Pair there, then press Enter here.", (220, 220, 225)),
+                         (font, "Esc = cancel", (160, 160, 170))]
+            else:
+                lines = [(big, f"Let {(pr.get('phone') or 'iPhone')[:22]} use this PC", (255, 255, 255)),
+                         (big, "as a mouse and keyboard?", (255, 255, 255)),
+                         (font, "Press Enter to allow, Esc to cancel.", (220, 220, 225))]
             surfs = [f_.render(t_, True, c_) for f_, t_, c_ in lines if t_]
             bw = max(x.get_width() for x in surfs) + 40
             bh = sum(x.get_height() + 6 for x in surfs) + 30
