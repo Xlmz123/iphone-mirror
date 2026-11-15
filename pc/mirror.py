@@ -591,6 +591,10 @@ def main() -> None:
     enable_dpi_awareness()
     pygame.init()
     pygame.display.set_caption("MirrorLink")
+    try:
+        pygame.display.set_icon(pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mirrorlink.png")))
+    except (pygame.error, FileNotFoundError):
+        pass
     info = pygame.display.Info()
     desk_w, desk_h = (info.current_w or 1920), (info.current_h or 1080)
     win_scale = 1.0
@@ -933,5 +937,29 @@ def main() -> None:
     pygame.quit()
 
 
+def run_with_crash_log() -> None:
+    """The taskbar shortcut has no console, so record crashes in pc/viewer-error.log
+    and show a message box instead of vanishing silently."""
+    try:
+        main()
+    except Exception:
+        import traceback
+        text = traceback.format_exc()
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer-error.log")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("\n--- %Y-%m-%d %H:%M:%S\n") + text)
+        except OSError:
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, f"MirrorLink stopped because of an error.\n\nDetails were saved to:\n{path}",
+                                                 "MirrorLink", 0x10)
+            except Exception:
+                pass
+        raise
+
+
 if __name__ == "__main__":
-    main()
+    run_with_crash_log()

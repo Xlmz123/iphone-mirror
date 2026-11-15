@@ -21,6 +21,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private let jpeg = JPEGEncoder()
     private var jpegMode = false
     private var hwFailStreak = 0
+    private var lastHWProbe: CFTimeInterval = 0     // background: retry the hardware encoder
+    private var hwProbing = false
     private var lastOrientation = ""               // capture-queue only
     let input = InputBridge()
     var onLog: ((String) -> Void)?
@@ -43,6 +45,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         /// lower than this on older iPhones; frames are simply skipped.
         var jpegMaxFPS = 60.0
         var jpegQuality = 0.6
+        var jpegMaxHeight: CGFloat = 1400
     }
     private var tuning = Tuning()                    // guarded by lock
     private var currentLink: LinkType?               // guarded by lock
@@ -66,6 +69,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         server.setHello(["name": deviceName])
         encoder.onEncoded = { [weak self] data, key, ts in
             self?.server.sendVideo(data, keyframe: key, timestampUs: ts)
+        }
+        jpeg.onEncoded = { [weak self] data, ts in
+            self?.server.sendJPEG(data, timestampUs: ts)
         }
         server.onKeyframeRequested = { [weak self] in self?.keyframeRequested() }
         server.onConfig = { [weak self] cfg in self?.apply(config: cfg) }
@@ -174,6 +180,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         if let v = num("keyframe_interval_s") { tuning.keyframeInterval = clamp(v, 1, 10) }
         if let v = num("jpeg_max_fps") { tuning.jpegMaxFPS = clamp(v, 5, 60) }
         if let v = num("jpeg_quality") { tuning.jpegQuality = clamp(v, 0.2, 0.95) }
+        if let v = num("jpeg_max_height") { tuning.jpegMaxHeight = CGFloat(clamp(v, 480, 3000)) }
         let t = tuning
         let link = currentLink
         lock.unlock()
@@ -225,6 +232,27 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         lastEncodeTime = now
 
         if jpegMode {
+            // Every 3 s, see whether iOS lets us use the hardware encoder again
+            // (it can, depending on iOS version); if so, go back to smooth H.264.
+            if now - lastHWProbe > 3 {
+                lastHWProbe = now
+                encoder.invalidate()
+                _ = encoder.takeErrorCount()
+                _ = encoder.takeSuccessCount()
+                hwProbing = encoder.encode(pixelBuffer, pts: hostTime(), forceKey: true)
+            } else if hwProbing {
+                if encoder.takeSuccessCount() > 0 {
+                    hwProbing = false
+                    hwFailStreak = 0
+                    jpegMode = false
+                    onMode?(false)
+                    onLog?("Hardware video works in the background → back to H.264")
+                    encoder.encode(pixelBuffer, pts: hostTime())
+                    countFrame()
+                    return
+                }
+                if encoder.takeErrorCount() > 0 || now - lastHWProbe > 1 { hwProbing = false }
+            }
             sendJPEG(pixelBuffer)
         } else {
             let ok = encoder.encode(pixelBuffer, pts: hostTime())
@@ -289,9 +317,11 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func sendJPEG(_ pixelBuffer: CVPixelBuffer) {
-        lock.lock(); let q = tuning.jpegQuality; lock.unlock()
-        guard let data = jpeg.encode(pixelBuffer, quality: CGFloat(q)) else { return }
-        server.sendJPEG(data, timestampUs: Wire.nowUs())
+        lock.lock(); let q = tuning.jpegQuality; let maxH = tuning.jpegMaxHeight; lock.unlock()
+        let h = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        let scale = min(1, maxH / max(h, 1))
+        // Returns false if all workers are busy: this frame is skipped, the next one goes.
+        jpeg.submit(pixelBuffer, quality: CGFloat(q), scale: scale, timestampUs: Wire.nowUs())
     }
 
     /// Call when the app returns to the foreground: hardware video works again,
