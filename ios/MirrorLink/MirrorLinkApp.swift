@@ -14,6 +14,7 @@ struct MirrorLinkApp: App {
 
 struct ContentView: View {
     @EnvironmentObject var c: MirrorController
+    @Environment(\.scenePhase) private var scenePhase
     @State private var confirmReset = false
 
     private var pcText: String {
@@ -91,11 +92,25 @@ struct ContentView: View {
                 .padding()
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
 
+                // Event log (troubleshooting)
+                if !c.events.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Recent events").font(.caption.bold()).foregroundStyle(.secondary)
+                        ForEach(Array(c.events.reversed().enumerated()), id: \.offset) { _, e in
+                            Text(e).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+
                 Text(c.status).font(.caption2).foregroundStyle(.tertiary)
             }
             .padding(24)
         }
         .onAppear { c.refreshAddress() }
+        .onChange(of: scenePhase) { _, phase in c.scenePhaseChanged(phase) }
         .confirmationDialog("Reset pairing?", isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Reset", role: .destructive) { c.resetPairing() }
         } message: {

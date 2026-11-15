@@ -35,6 +35,8 @@ targets:
         # Keeps screen capture alive when you leave the app (iOS 27+).
         UIBackgroundModes:
           - screen-capture
+          - audio          # silent-audio keep-alive (KeepAlive.swift)
+        NSScreenCaptureUsageDescription: MirrorLink shows your screen on your paired PC.
         # Wi-Fi mirroring: lets the PC find this iPhone on the local network.
         NSBonjourServices:
           - _mirrorlink._tcp

@@ -41,6 +41,10 @@ jobs:
         working-directory: ios
         run: grep -n -B2 -A6 "error:" build.log | head -200 || true
 
+      - name: Show built Info.plist (background modes check)
+        working-directory: ios
+        run: plutil -p build/Build/Products/Release-iphoneos/MirrorLink.app/Info.plist | grep -A4 -E "UIBackgroundModes|NSScreenCapture"
+
       - name: Package .ipa
         working-directory: ios
         run: |
