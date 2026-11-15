@@ -57,6 +57,19 @@ The first time the viewer connects over **USB**, it pairs with the phone and sav
 
 **Tip:** while testing, set **Settings → Display & Brightness → Auto-Lock → Never**.
 
+### Tuning speed and quality: `pc/settings.json`
+Change a number, save the file, and the phone applies it within a second. No rebuild, and no restarting the viewer.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `max_height` | 1400 | Stream height in pixels. Lower = less lag and less work for the phone. |
+| `max_fps` | 60 | Frame rate cap. |
+| `bitrate_usb` / `bitrate_wifi` | 1.0 / 0.6 | Picture quality. Lower it if video stutters. |
+| `max_queued_frames_usb` / `_wifi` | 4 / 6 | Frames allowed in flight before the phone skips ahead. Lower = snappier, more skipping. |
+| `keyframe_interval_s` | 3 | Seconds between full refresh frames. |
+
+The app's **Frames** line shows fps · frames skipped · keyframes per second, and the viewer's F1 overlay shows the stream resolution.
+
 ### Viewer options (`run.bat` passes these through)
 ```
 run.bat --usb-only            never use Wi-Fi

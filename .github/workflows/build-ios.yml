@@ -33,7 +33,8 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build | tee build.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/MirrorLink.app
+          # Xcode creates the .app folder before compiling, so check the program itself exists.
+          test -f build/Build/Products/Release-iphoneos/MirrorLink.app/MirrorLink
 
       - name: Show errors if the build failed
         if: failure()

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pc/.venv/
+ios/build/
+ios/*.xcodeproj/

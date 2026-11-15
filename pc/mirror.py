@@ -38,7 +38,26 @@ WIFI_PORT = 47801
 HEADER = struct.Struct(">IBQ")   # length, type, timestamp(us)
 
 MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_PAIR_INFO = 0x01, 0x02, 0x03, 0x21
-MSG_REQ_KEY, MSG_PING, MSG_PONG, MSG_ACK, MSG_PAIR_REQ = 0x10, 0x11, 0x12, 0x13, 0x20
+MSG_REQ_KEY, MSG_PING, MSG_PONG, MSG_ACK, MSG_CONFIG, MSG_PAIR_REQ = 0x10, 0x11, 0x12, 0x13, 0x14, 0x20
+
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+
+def load_settings() -> dict:
+    """pc/settings.json, minus the help text. Bad/missing file -> {} (phone keeps its defaults)."""
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except (OSError, ValueError):
+        return {}
+
+
+def settings_mtime() -> float:
+    try:
+        return os.path.getmtime(SETTINGS_PATH)
+    except OSError:
+        return 0.0
 
 
 def send_msg(link: PlainLink, mtype: int, payload: bytes = b"") -> None:
@@ -91,6 +110,8 @@ class Receiver(threading.Thread):
         self._stop = threading.Event()
         self.link: PlainLink | None = None
         self.pairing = pairing_store.load()
+        self.status_note = ""
+        self.note_until = 0.0
 
     @property
     def connected(self) -> bool:
@@ -198,12 +219,21 @@ class Receiver(threading.Thread):
         alive.set()
 
         def background() -> None:
-            # Ping every second (round-trip time). On Wi-Fi, also switch to USB
-            # as soon as the cable is plugged in.
+            # Ping every second (round-trip time); re-send settings.json when it's
+            # saved; on Wi-Fi, switch to USB as soon as the cable is plugged in.
             n = 0
+            sent_mtime = settings_mtime()
             while alive.is_set() and not self._stop.is_set():
                 try:
                     send_msg(link, MSG_PING, struct.pack(">d", time.perf_counter()))
+                    m = settings_mtime()
+                    if m != sent_mtime:
+                        sent_mtime = m
+                        cfg = load_settings()
+                        if cfg:
+                            send_msg(link, MSG_CONFIG, json.dumps(cfg).encode())
+                            self.status_note = "settings.json applied"
+                            self.note_until = time.time() + 3
                 except OSError:
                     return
                 n += 1
@@ -255,6 +285,12 @@ class Receiver(threading.Thread):
                     self.device_name = info.get("name", "iPhone")
                     if "w" in info:
                         self.status = f"Streaming from {self.device_name}"
+                    # Send our tuning settings (first hello of a session only).
+                    if not getattr(link, "_config_sent", False):
+                        cfg = load_settings()
+                        if cfg:
+                            send_msg(link, MSG_CONFIG, json.dumps(cfg).encode())
+                        link._config_sent = True
                     # Over USB: (re)pair if this PC doesn't know this phone's current key.
                     if link.kind == "usb" and (self.pairing is None or self.pairing.id_hex != info.get("id")):
                         send_msg(link, MSG_PAIR_REQ)
@@ -393,7 +429,9 @@ def main() -> None:
                 f"{ {'usb': 'USB', 'wifi': 'Wi-Fi (encrypted)'}.get(rx.link_kind or '', 'not connected') }"
                 f"{' · paired' if rx.pairing else ''}",
                 f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps",
-                f"decode {s['decode_ms']:.1f} ms · USB round trip {rtt}",
+                f"decode {s['decode_ms']:.1f} ms · round trip {rtt}"
+                f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}",
+                *([rx.status_note] if time.time() < rx.note_until else []),
                 "F1 stats · F11 fullscreen · Esc quit",
             ]
             pad = 8

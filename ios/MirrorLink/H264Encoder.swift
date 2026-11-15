@@ -1,6 +1,7 @@
 import Foundation
 import VideoToolbox
 import CoreMedia
+import QuartzCore
 
 /// Hardware H.264 encoder tuned for latency, not file size:
 /// - low-latency rate control (Apple's mode for video calls)
@@ -18,6 +19,10 @@ final class H264Encoder {
     private var forceKeyframe = true
     private var bitrateFactor = 1.0          // lower on Wi-Fi
     private var bitrateDirty = false
+    private var keyframeInterval = 3.0
+    private var keyIntervalDirty = false
+    private var lastForcedKey: CFTimeInterval = 0
+    private var keyframeCount = 0
     private let lock = NSLock()
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]
@@ -26,10 +31,22 @@ final class H264Encoder {
         lock.lock(); forceKeyframe = true; lock.unlock()
     }
 
+    /// Keyframes produced since the last call.
+    func takeKeyframeCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let n = keyframeCount; keyframeCount = 0; return n
+    }
+
     /// 1.0 for USB; less for Wi-Fi, where a smaller stream means fewer stalls.
     func setBitrateFactor(_ f: Double) {
         lock.lock()
         if f != bitrateFactor { bitrateFactor = f; bitrateDirty = true }
+        lock.unlock()
+    }
+
+    func setKeyframeInterval(_ seconds: Double) {
+        lock.lock()
+        if seconds != keyframeInterval { keyframeInterval = seconds; keyIntervalDirty = true }
         lock.unlock()
     }
 
@@ -83,7 +100,8 @@ final class H264Encoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         // Periodic keyframe so a glitch heals within a few seconds even if
         // the PC never asks for one.
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 3 as CFNumber)
+        lock.lock(); let kInt = keyframeInterval; keyIntervalDirty = false; lock.unlock()
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: kInt as CFNumber)
         VTCompressionSessionPrepareToEncodeFrames(s)
 
         session = s
@@ -102,11 +120,22 @@ final class H264Encoder {
         guard let session else { return }
 
         lock.lock()
-        let key = forceKeyframe
-        forceKeyframe = false
+        // Keyframes are big; never force more than ~3 per second, or a struggling
+        // link gets buried in them. A pending request waits for the next slot.
+        let now = CACurrentMediaTime()
+        let key = forceKeyframe && now - lastForcedKey >= 0.3
+        if key { forceKeyframe = false; lastForcedKey = now }
         let dirty = bitrateDirty
         bitrateDirty = false
+        let kDirty = keyIntervalDirty
+        keyIntervalDirty = false
+        let kInt = keyframeInterval
         lock.unlock()
+
+        if kDirty {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                                 value: kInt as CFNumber)
+        }
 
         if dirty {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
@@ -187,6 +216,7 @@ final class H264Encoder {
             }
         }
 
+        if isKey { lock.lock(); keyframeCount += 1; lock.unlock() }
         onEncoded?(out, isKey, timestampUs)
     }
 }
