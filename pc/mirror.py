@@ -677,7 +677,8 @@ def main() -> None:
         h = TOP_BAR - 10
         apps = pygame.Rect(sw - 8 - 104, 5, 104, h)
         home = pygame.Rect(apps.left - 6 - 64, 5, 64, h)
-        return {"home": home, "switcher": apps}
+        rotate = pygame.Rect(home.left - 6 - 64, 5, 64, h)
+        return {"rotate": rotate, "home": home, "switcher": apps}
 
     def home_zone():
         x, y, w, h = last_rect
@@ -772,7 +773,10 @@ def main() -> None:
             elif ev.type == pygame.MOUSEBUTTONDOWN:
                 if ev.button == 1:
                     hit = next((k for k, r in bar_buttons().items() if r.collidepoint(ev.pos)), None)
-                    if hit and not fullscreen and ev.pos[1] < TOP_BAR:
+                    if hit == "rotate" and not fullscreen and ev.pos[1] < TOP_BAR:
+                        manual_rot = (manual_rot + 90) % 360
+                        sized_for = None
+                    elif hit and not fullscreen and ev.pos[1] < TOP_BAR:
                         ctl.key(hit)
                     elif home_zone().collidepoint(ev.pos):
                         ctl.key("home")             # the home bar, like on macOS
@@ -887,10 +891,11 @@ def main() -> None:
             for name, r in bar_buttons().items():
                 hover = r.collidepoint(mouse)
                 pygame.draw.rect(screen, (70, 70, 78) if hover else (44, 44, 50), r, border_radius=7)
-                label = btn_font.render("Home" if name == "home" else "App Switcher", True, (235, 235, 240))
+                label = btn_font.render({"home": "Home", "rotate": "Rotate"}.get(name, "App Switcher"), True, (235, 235, 240))
                 screen.blit(label, label.get_rect(center=r.center))
             hint = font.render("Ctrl+1 Home · Ctrl+2 Apps · Ctrl+3 Search", True, (130, 130, 140))
-            screen.blit(hint, (10, (TOP_BAR - hint.get_height()) // 2))
+            if hint.get_width() + 20 < bar_buttons()["rotate"].left:
+                screen.blit(hint, (10, (TOP_BAR - hint.get_height()) // 2))
 
         # Home bar at the bottom of the phone picture: highlight on hover, click = Home.
         if last_surface is not None and home_zone().collidepoint(mouse):
