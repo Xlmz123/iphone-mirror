@@ -1,4 +1,9 @@
 {
+  "control": "bluetooth",
+  "bt_coordinates": "screen",
+  "bt_drag_scale": 1.0,
+  "bt_scroll_speed": 30,
+  "bt_wheel_step": 0.12,
   "max_height": 1400,
   "max_fps": 60,
   "bitrate_usb": 1.0,
@@ -11,6 +16,11 @@
   "orientation_map": {},
   "jpeg_max_height": 1400,
   "_help": {
+    "control": "How the PC controls the phone: \"bluetooth\" (the PC acts as a Bluetooth mouse + keyboard; no overlay on the phone) or \"helper\" (the WebDriverAgent helper; shows \"Automation Running\" on the phone). Restart the viewer after changing.",
+    "bt_coordinates": "Bluetooth only. \"screen\" (normal) or \"portrait\": try \"portrait\" only if clicks land in the wrong place while the phone is in landscape.",
+    "bt_drag_scale": "Bluetooth only. If drags and scrolls go too far, lower this (e.g. 0.8); too short, raise it (e.g. 1.2). Depends on the iPhone's AssistiveTouch Tracking Speed.",
+    "bt_scroll_speed": "Bluetooth only. Fastest scroll speed (points per step, 5-80).",
+    "bt_wheel_step": "Bluetooth only. How far one mouse-wheel notch scrolls, as a share of the screen (0.02-0.5).",
     "max_height": "Stream height in pixels (480-3000). Lower = less lag and less phone load. ~1000-1400 matches a laptop screen.",
     "max_fps": "Frame rate cap (5-120). 60 matches most monitors.",
     "bitrate_usb": "Video quality multiplier over USB (0.1-3). 1.0 = about 0.08 bits per pixel per frame.",

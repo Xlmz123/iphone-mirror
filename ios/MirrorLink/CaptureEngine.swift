@@ -111,6 +111,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: Start / stop
 
+    /// The screen in points (portrait); sent to the PC for Bluetooth control. Set on the main thread before start.
+    var screenPoints: CGSize = .zero
+
     /// `pixelSize`: the screen's native resolution in pixels (portrait).
     func start(filter: SCContentFilter, pixelSize: CGSize, completion: @escaping (Error?) -> Void) {
         lastFilter = filter
@@ -122,9 +125,12 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = Int(pixelSize.height * scale) & ~1
         config.capturesAudio = false
 
-        server.setHello(["w": config.width,
-                         "h": config.height,
-                         "name": deviceName])
+        var hello: [String: Any] = ["w": config.width, "h": config.height, "name": deviceName]
+        if screenPoints.width > 0 {          // for Bluetooth control: the screen in points
+            hello["pt_w"] = Double(screenPoints.width)
+            hello["pt_h"] = Double(screenPoints.height)
+        }
+        server.setHello(hello)
 
         let s = SCStream(filter: filter, configuration: config, delegate: self)
         do {
