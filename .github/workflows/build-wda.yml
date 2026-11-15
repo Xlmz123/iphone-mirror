@@ -1,0 +1,64 @@
+name: Build control helper (WebDriverAgent)
+
+# WebDriverAgent is Appium's open-source automation server. It uses Apple's
+# UI-testing system to tap, swipe and type on the iPhone, which is how the PC
+# controls the phone. This builds it unsigned; Sideloadly signs it on install.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-wda.yml"
+  workflow_dispatch:
+
+env:
+  # appium/appium-ios monorepo, packages/webdriveragent (WDA 17.0.6), pinned for reproducible builds.
+  WDA_REPO: https://github.com/appium/appium-ios
+  WDA_COMMIT: 432fc7c43f8a6830cb215e54393170b9ba12249d
+
+jobs:
+  build:
+    runs-on: xcode-27
+    steps:
+      - name: Get WebDriverAgent source
+        run: |
+          git clone --filter=blob:none --no-checkout "$WDA_REPO" wda-src
+          cd wda-src
+          git sparse-checkout set packages/webdriveragent
+          git checkout "$WDA_COMMIT"
+
+      - name: Build (unsigned, for real devices)
+        working-directory: wda-src/packages/webdriveragent
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO ARCHS=arm64 \
+            | tee build.log | grep -E "error:|\*\* (TEST BUILD|BUILD) (SUCCEEDED|FAILED)" || true
+          # Check the actual test bundle binary exists (not just the folder).
+          test -f build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/PlugIns/WebDriverAgentRunner.xctest/WebDriverAgentRunner
+
+      - name: Show errors if the build failed
+        if: failure()
+        working-directory: wda-src/packages/webdriveragent
+        run: grep -n -B2 -A6 "error:" build.log | head -200 || true
+
+      - name: Package .ipa
+        run: |
+          APP=wda-src/packages/webdriveragent/build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          # Same as Appium's real-device packaging: drop the copies of Apple's XCTest
+          # libraries so the phone's own (from the developer disk image) are used.
+          # This is required to launch it as a normal process on iOS 17+.
+          rm -rf Payload/WebDriverAgentRunner-Runner.app/Frameworks/*
+          plutil -p Payload/WebDriverAgentRunner-Runner.app/Info.plist | grep -E "CFBundleIdentifier|MinimumOSVersion"
+          ls Payload/WebDriverAgentRunner-Runner.app/PlugIns/
+          zip -qry WebDriverAgent-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgent-ipa
+          path: WebDriverAgent-unsigned.ipa
