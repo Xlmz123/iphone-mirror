@@ -121,6 +121,7 @@ class Receiver(threading.Thread):
         self.connected_at = 0.0
         self.kicked = False                  # another viewer took over
         self.resume = threading.Event()
+        self.suspended = False               # cable capture is showing the picture: don't decode
 
     @property
     def connected(self) -> bool:
@@ -249,6 +250,7 @@ class Receiver(threading.Thread):
         codec.options = {"flags": "low_delay"}   # output each frame immediately
         codec.thread_type = "SLICE"              # frame threading would add latency
         waiting_for_key = True
+        asked_key = 0.0
         alive = threading.Event()
         alive.set()
 
@@ -291,6 +293,8 @@ class Receiver(threading.Thread):
                     # Phone is in the background: iOS blocks its hardware video encoder,
                     # so it sends standalone JPEG pictures instead.
                     send_msg(link, MSG_ACK, struct.pack(">Q", ts))
+                    if self.suspended:
+                        continue
                     self.count["jpeg"] += 1
                     self.mode = "JPEG (phone app in background)"
                     if jpeg_codec is None:
@@ -317,8 +321,14 @@ class Receiver(threading.Thread):
                     self.mode = "H.264"
                     # Acknowledge on arrival: tells the phone the link is keeping up.
                     send_msg(link, MSG_ACK, struct.pack(">Q", ts))
+                    if self.suspended:
+                        waiting_for_key = True
+                        continue
                     self.count["key" if mtype == MSG_KEY else "delta"] += 1
                     if waiting_for_key and mtype != MSG_KEY:
+                        if time.monotonic() - asked_key > 1.0:   # resuming: ask for a fresh picture
+                            asked_key = time.monotonic()
+                            send_msg(link, MSG_REQ_KEY)
                         continue
                     waiting_for_key = False
                     t0 = time.perf_counter()
@@ -398,6 +408,7 @@ import numpy as np  # noqa: E402  (PyAV already depends on it)
 
 from helper import ControlHelper  # noqa: E402
 from btcontrol import BtControl, BtInput  # noqa: E402
+from videosource import CableReceiver, VideoSource  # noqa: E402
 
 TOP_BAR = 34          # strip above the phone picture for the Home / App Switcher buttons (like macOS)
 
@@ -622,7 +633,17 @@ def main() -> None:
     btn_font = pygame.font.SysFont("segoeui,arial", 14, bold=True)
 
     stats = Stats()
-    rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
+    cfg0 = load_settings()
+    app_rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
+    cable_rx = None
+    if cfg0.get("video_source", "auto") != "app":
+        try:
+            size = int(cfg0.get("cable_size", 2000))
+        except (TypeError, ValueError):
+            size = 2000
+        cable_rx = CableReceiver(stats, display_size=max(480, min(4000, size)),
+                                 log_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cable.log"))
+    rx = VideoSource(app_rx, cable_rx)
     rx.start()
     helper = ControlHelper()
     use_bt = load_settings().get("control", "bluetooth") != "helper"
@@ -827,6 +848,7 @@ def main() -> None:
                 dirty = True
 
         ctl.tick()
+        rx.sync_suspend()
 
         # Start the control helper automatically (USB only, once per connection).
         if (not use_bt and rx.connected and rx.link_kind == "usb" and not rx.control_ready and not helper.busy
@@ -940,13 +962,15 @@ def main() -> None:
                 control = "Control: not ready (F5 to start)"
             lines = [
                 f"{rx.device_name or 'iPhone'} · "
-                f"{ {'usb': 'USB', 'wifi': 'Wi-Fi (encrypted)'}.get(rx.link_kind or '', 'not connected') }"
+                f"{ {'usb': 'USB (MirrorLink app)', 'wifi': 'Wi-Fi (encrypted)', 'cable': 'USB cable capture (no red dot)'}.get(rx.link_kind or '', 'not connected') }"
                 f"{' · paired' if rx.pairing else ''}",
                 f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps · {rx.mode}",
                 f"decode {s['decode_ms']:.1f} ms · round trip {rtt}"
                 f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}"
                 f" · orientation {rx.orientation_raw if rx.orientation_raw is not None else '–'} ({rot}°)",
                 control,
+                *([f"Cable capture: {cable_rx.problem}"] if cable_rx is not None and cable_rx.problem
+                  and not rx.using_cable else []),
                 *([rx.status_note] if time.time() < rx.note_until else []),
                 ("F1 stats · F5 reconnect control · F11 fullscreen · Ctrl+K phone keyboard · Ctrl+R rotate · Ctrl+Q quit"
                  if use_bt else "F1 stats · F5 start control · F11 fullscreen · Ctrl+R rotate · Ctrl+Q quit"),

@@ -4,6 +4,8 @@ MirrorLink shows your iPhone's screen in a window on your Windows PC, and lets y
 your mouse and keyboard on it. It works roughly like **iPhone Mirroring** on a Mac.
 
 - **Video:** up to 60 fps with low lag, over a **USB cable** or your **Wi-Fi** (encrypted).
+  Over the cable it can use the iPhone's own screen sharing (the one QuickTime uses on a
+  Mac): **no red recording dot and no app needed on the phone**. See [Cable capture](#cable-capture-no-red-dot).
 - **Control:** your PC acts as a **Bluetooth mouse and keyboard** for the phone. No extra
   hardware is needed, as long as your PC has Bluetooth.
 - **Free.** No Mac needed, no jailbreak, and no paid Apple developer account.
@@ -111,6 +113,33 @@ with its own icon on your Desktop and in the Start menu. To pin it, open **Start
 
 ---
 
+## Cable capture (no red dot)
+When an app records the screen, iOS shows a red dot. Over the cable, MirrorLink can instead
+use the iPhone's built-in screen sharing — the feature QuickTime uses on a Mac — so there's
+**no red dot, no app to keep open on the phone, and the picture keeps up in every app**. The
+picture also turns by itself when the phone or an app goes landscape.
+
+It needs one extra USB driver on the PC (Windows' own USB driver can't switch the iPhone into
+screen-sharing mode). The easiest tested way to install it:
+
+1. Install **iPhoneMirror** from https://github.com/RayrenSX/iPhoneMirror/releases
+   (`iPhoneMirror-Setup-…-x64.exe`; it isn't code-signed, so Windows may warn — **More info → Run anyway**).
+2. Plug in and unlock the iPhone, open iPhoneMirror → **Driver** (驱动) → **Install All Drivers**
+   (一键安装全部驱动), and approve the admin prompt. This adds a small *libusb0 filter* to the
+   iPhone's USB entry; it doesn't replace Apple's driver.
+3. **Close iPhoneMirror** (only one program can use screen sharing at a time). Keep it installed:
+   its Driver page can also remove the driver again.
+
+Then just open MirrorLink with the cable plugged in and the phone unlocked. Press **F1**: it
+says **"USB cable capture (no red dot)"**. You don't need to tap Start Mirroring on the phone.
+Unplugged, MirrorLink falls back to the app over Wi-Fi (with the red dot).
+
+Details of what happens are in `pc/cable.log`. This uses Apple's private protocol; it works on
+iOS 27 today but a future iOS update could change it. Set `"video_source": "app"` in
+`pc/settings.json` to turn it off.
+
+---
+
 ## Everyday use
 1. On the iPhone, open **MirrorLink** and tap **Start Mirroring** (entire screen) if it isn't
    already running. You can leave the app afterwards; it keeps sending in the background.
@@ -155,9 +184,9 @@ plain English (US) keyboard characters can be typed. Emoji and accented letters 
 ---
 
 ## Limitations
-- **The red dot.** While mirroring, iOS shows a red recording dot at the top of the screen.
-  Every app that captures the screen gets it, so a spy app can't hide. MirrorLink can't
-  remove it.
+- **The red dot.** Over Wi-Fi (the MirrorLink app), iOS shows a red recording dot at the top
+  of the screen — every app that records the screen gets it. Over the cable with
+  [cable capture](#cable-capture-no-red-dot) there's no red dot.
 - **The on-screen keyboard hides** while the PC is connected, because iOS thinks a real keyboard
   is attached. Press **Ctrl+K** in the viewer to bring it back, or close the viewer.
 - **Swipes and scrolls are close, not pixel-exact.** A Bluetooth mouse moves by distance, so a drag
@@ -175,6 +204,8 @@ Open it in Notepad, change a number, and save. Video settings apply within a sec
 
 | Setting | Default | What it does |
 |---|---|---|
+| `video_source` | `"auto"` | `"auto"` = cable capture when it works, else the MirrorLink app. `"app"` = always the app. |
+| `cable_size` | 2000 | Cable capture: the largest picture side the iPhone is asked for. |
 | `control` | `"bluetooth"` | `"bluetooth"`, or `"helper"` to use the [control helper](#other-way-to-control-the-control-helper) instead |
 | `bt_drag_scale` | 1.0 | Drags and scrolls go too far → lower it (0.8). Too short → raise it (1.2). |
 | `bt_wheel_step` | 0.12 | How far one mouse-wheel notch scrolls |
@@ -259,6 +290,9 @@ so the phone is hard to use in your hand. To use it:
   it with your Apple ID when it installs.
 
 ## Credits
+- Cable capture follows the protocol reverse engineered and documented by Daniel Paulus in
+  [quicktime_video_hack](https://github.com/danielpaulus/quicktime_video_hack) (MIT License);
+  its recorded packets are used to test MirrorLink's implementation.
 - Bluetooth control is based on the measurements and HID descriptor published by
   [phoneuse](https://github.com/lxe/phoneuse) (MIT License, © 2026 Aleksey Smolenchuk). They
   worked out how iOS reacts to a Bluetooth pointer.
