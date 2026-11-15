@@ -636,7 +636,7 @@ def main() -> None:
     cfg0 = load_settings()
     app_rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
     cable_rx = None
-    if cfg0.get("video_source", "auto") != "app":
+    if cfg0.get("video_source", "app") == "cable":   # experimental: can crash Windows on some PCs
         try:
             size = int(cfg0.get("cable_size", 2000))
         except (TypeError, ValueError):
