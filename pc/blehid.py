@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 7          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 8          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -469,8 +469,9 @@ class WinHid:
                     can = d.pairing.can_pair
                 except (OSError, AttributeError):
                     paired, can = "?", False
-                seen.append(f"{kind} '{d.name}' paired={paired}")
-                if kind == "LE" and paired is False and can and not self.clients:
+                seen.append(f"{kind} '{d.name}' paired={paired} can_pair={can}")
+                # (can_pair isn't reliable from this list; _pair asks the device itself)
+                if kind == "LE" and paired is False and not self.clients:
                     asyncio.ensure_future(self._pair(d))
         text = "; ".join(sorted(seen)) or "none"
         if text != getattr(self, "_last_links", None):
@@ -547,15 +548,30 @@ class WinHid:
             return
         self._pair_tried[d.id] = now
         self.pairing_busy = True
-        from winrt.windows.devices.enumeration import (DevicePairingKinds as K,
-                                                        DevicePairingProtectionLevel as L,
-                                                        DevicePairingResultStatus as R)
+        custom = token = None
         name = d.name or "a phone"
-        custom = d.pairing.custom
-        token = custom.add_pairing_requested(
-            lambda sender, args: self.loop.call_soon_threadsafe(self._on_pair_request, name, args, args.get_deferral()))
-        log(f"'{name}' is connected but not paired: pairing from the PC")
         try:
+            from winrt.windows.devices.enumeration import (DevicePairingKinds as K,
+                                                            DevicePairingProtectionLevel as L,
+                                                            DevicePairingResultStatus as R)
+            info = d
+            try:        # the full device record (the list can lack pairing details)
+                le = await self.w["BluetoothLEDevice"].from_id_async(d.id)
+                if le is not None:
+                    self._pair_device = le      # keep it alive while pairing
+                    info = le.device_information
+                    name = le.name or name
+            except Exception as e:
+                log(f"couldn't open '{name}' for pairing: {e!r}")
+            try:
+                log(f"'{name}': paired={info.pairing.is_paired} can_pair={info.pairing.can_pair} "
+                    f"protection={int(info.pairing.protection_level)}")
+            except Exception:
+                pass
+            custom = info.pairing.custom
+            token = custom.add_pairing_requested(
+                lambda sender, args: self.loop.call_soon_threadsafe(self._on_pair_request, name, args, args.get_deferral()))
+            log(f"'{name}' is connected but not paired: pairing from the PC")
             r = await custom.pair_async(K.CONFIRM_ONLY | K.CONFIRM_PIN_MATCH | K.DISPLAY_PIN, L.ENCRYPTION)
             try:
                 result = R(r.status).name
@@ -565,10 +581,11 @@ class WinHid:
         except Exception as e:
             log(f"pairing with '{name}' failed: {e!r}")
         finally:
-            try:
-                custom.remove_pairing_requested(token)
-            except Exception:
-                pass
+            if custom is not None and token is not None:
+                try:
+                    custom.remove_pairing_requested(token)
+                except Exception:
+                    pass
             self.answer_pairing(False)          # nothing left waiting
             self.pairing_busy = False
             self.changed()
