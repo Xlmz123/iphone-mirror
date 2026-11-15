@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 3          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 4          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -281,8 +281,9 @@ class WinHid:
         hid = await self._provider(0x1812)
         self.providers = [("HID", hid)]
         s = hid.service
-        await self._char(s, 0x2A4A, P.READ, value=bytes([0x11, 0x01, 0x00, 0x02]))   # HID information
-        await self._char(s, 0x2A4B, P.READ, value=REPORT_MAP)                       # report map
+        # Served by us (not static) so the log shows how far the iPhone gets.
+        await self._char(s, 0x2A4A, P.READ, served=("HID information", bytes([0x11, 0x01, 0x00, 0x02])))
+        await self._char(s, 0x2A4B, P.READ, served=("report map", REPORT_MAP))
         cp = await self._char(s, 0x2A4C, P.WRITE_WITHOUT_RESPONSE, encrypted=False)  # control point
         cp.add_write_requested(self._on_write)
         for rid, size in REPORT_SIZES.items():
@@ -328,7 +329,7 @@ class WinHid:
             raise RuntimeError(f"service {n:#06x}: {self.w['BluetoothError'](r.error).name}")
         return r.service_provider
 
-    async def _char(self, service, n: int, props, value=None, encrypted: bool = True):
+    async def _char(self, service, n: int, props, value=None, encrypted: bool = True, served=None):
         p = self.g.GattLocalCharacteristicParameters()
         p.characteristic_properties = props
         if encrypted:          # reading these makes the iPhone pair (bond) first, as HID requires
@@ -339,7 +340,35 @@ class WinHid:
         r = await service.create_characteristic_async(self._uuid(n), p)
         if r.error != self.w["BluetoothError"].SUCCESS:
             raise RuntimeError(f"characteristic {n:#06x}: {self.w['BluetoothError'](r.error).name}")
+        if served is not None:
+            r.characteristic.add_read_requested(self._reader(*served))
         return r.characteristic
+
+    def _reader(self, name: str, value: bytes):
+        """Answer reads of `value` ourselves (long values come in pieces, by offset) and log them."""
+        def handler(characteristic, args) -> None:
+            deferral = args.get_deferral()
+
+            async def answer():
+                try:
+                    try:
+                        who = args.session.device_id.id[-17:]
+                    except (OSError, AttributeError):
+                        who = "?"
+                    req = await args.get_request_async()
+                    if req is None:
+                        log(f"{who} tried to read the {name} before pairing (iOS should pair now)")
+                        return
+                    off = req.offset
+                    req.respond_with_value(self._buffer(value[off:]))
+                    if off == 0:
+                        log(f"{who} read the {name}")
+                except Exception as e:
+                    log(f"answering a read of the {name} failed: {e!r}")
+                finally:
+                    deferral.complete()
+            asyncio.run_coroutine_threadsafe(answer(), self.loop)
+        return handler
 
     def _on_write(self, characteristic, args) -> None:
         self.loop.call_soon_threadsafe(log, "the iPhone wrote the HID control point (it's using the keyboard/mouse)")
