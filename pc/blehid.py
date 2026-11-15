@@ -339,6 +339,7 @@ class WinHid:
         return r.characteristic
 
     def _on_write(self, characteristic, args) -> None:
+        self.loop.call_soon_threadsafe(log, "the iPhone wrote the HID control point (it's using the keyboard/mouse)")
         deferral = args.get_deferral()
 
         async def take():
@@ -391,14 +392,24 @@ class WinHid:
     def refresh(self) -> None:
         g = self.g
         seen = {}
-        for c in self.reports.values():
+        summary = []
+        for rid, c in self.reports.items():
+            subs = []
             for sub in c.subscribed_clients:
                 try:
                     session = sub.session
-                    if session.session_status == g.GattSessionStatus.ACTIVE:
+                    st = session.session_status
+                    subs.append(f"{session.device_id.id[-17:]}:{g.GattSessionStatus(st).name}")
+                    if st == g.GattSessionStatus.ACTIVE:
                         seen[session.device_id.id] = session
-                except OSError:
+                except OSError as e:
+                    subs.append(f"?({e})")
                     continue
+            summary.append(f"report {rid}: " + (", ".join(subs) if subs else "nobody"))
+        text = " | ".join(summary)
+        if text != getattr(self, "_last_summary", None):
+            self._last_summary = text
+            log("subscriptions:", text)
         before = set(self.clients)
         for dev in list(self.clients):
             if dev not in seen:
