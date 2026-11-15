@@ -93,6 +93,12 @@ Optional, once the PC is connected in step 6:
   goes away.
 - Leave **Tracking Speed** where it is. MirrorLink is tuned for the default.
 
+**Tip: toggle it with a triple-click.** Go to **Settings → Accessibility → Accessibility Shortcut**
+and tick only **AssistiveTouch**. Now triple-clicking the side button turns AssistiveTouch on before
+you use MirrorLink and off when you're done, so the button isn't on your screen the rest of the time.
+(You can also add **Accessibility Shortcuts** to Control Center, or set **Touch → Back Tap →
+Double Tap → AssistiveTouch**.)
+
 ### Step 6: First run and Bluetooth pairing
 1. Open the `pc` folder and double-click **`run.bat`**. The first run sets itself up, which takes a
    minute or two. Later runs start in seconds.
@@ -245,7 +251,7 @@ shown in the app, if Wi-Fi discovery doesn't work), `--forget` (delete this PC's
 | Your PC shows as **Connected** on the iPhone but has **no ⓘ**, and the pointer doesn't move | The iPhone has an out-of-date copy of the pairing. On the PC: **Settings → Bluetooth & devices → Devices**, remove **Apple iPhone** (and any other entry for your phone). On the iPhone: turn Bluetooth off and on, and if your PC has an ⓘ, **Forget This Device**. Then, with the viewer open, pair again. |
 | *…can't act as a keyboard/mouse* | Your PC's Bluetooth can't do it. A Bluetooth 5.0 USB adapter fixes it, or use `"control": "helper"`. |
 | *Bluetooth is off* | Windows Settings → Bluetooth & devices → turn Bluetooth on. |
-| Clicks do nothing, but it says connected | Turn on **AssistiveTouch** (setup step 5). |
+| Clicks do nothing, but it says connected | Turn on **AssistiveTouch** (setup step 5, or triple-click the side button if you set up the shortcut). |
 | Clicks land in the wrong place in landscape | Set `"bt_coordinates": "portrait"` in settings.json. |
 | Something else with control | Press **F5**. Details are in `pc/bluetooth.log`. |
 
