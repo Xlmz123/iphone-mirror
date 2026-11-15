@@ -696,6 +696,15 @@ def main() -> None:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
+            elif ev.type == pygame.KEYDOWN and use_bt and bt.pairing:
+                # A pairing code is on screen: Enter = the codes match, Esc = no.
+                if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    bt.answer_pairing(True)
+                    note("Paired — tap Pair on the iPhone too if it's still asking")
+                elif ev.key == pygame.K_ESCAPE:
+                    bt.answer_pairing(False)
+            elif ev.type == pygame.TEXTINPUT and use_bt and bt.pairing:
+                pass
             elif ev.type == pygame.KEYDOWN:
                 # Ctrl shortcuts (Cmd on a Mac keyboard). Ctrl+Alt is AltGr on many
                 # layouts (e.g. AltGr+Q = @), so that's typing, not a shortcut.
@@ -963,6 +972,26 @@ def main() -> None:
             bg.fill((0, 0, 0, 190))
             screen.blit(bg, (r.x - 10, r.y - 5))
             screen.blit(t, r)
+        pr = bt.pairing if use_bt else None
+        if pr:
+            lines = [(big, f"Pair with {(pr.get('phone') or 'iPhone')[:22]}?", (255, 255, 255)),
+                     (big, f"Code: {pr['pin']}" if pr.get("pin") else "", (120, 220, 255)),
+                     (font, "Same code on the iPhone?", (220, 220, 225)),
+                     (font, "Tap Pair there, then press Enter here.", (220, 220, 225)),
+                     (font, "Esc = cancel", (160, 160, 170))]
+            surfs = [f_.render(t_, True, c_) for f_, t_, c_ in lines if t_]
+            bw = max(x.get_width() for x in surfs) + 40
+            bh = sum(x.get_height() + 6 for x in surfs) + 30
+            box = pygame.Surface((bw, bh), pygame.SRCALPHA)
+            box.fill((20, 22, 30, 235))
+            bx, by = (screen.get_width() - bw) // 2, (screen.get_height() - bh) // 2
+            screen.blit(box, (bx, by))
+            pygame.draw.rect(screen, (90, 160, 255), (bx, by, bw, bh), 2, border_radius=8)
+            yy = by + 15
+            for x in surfs:
+                screen.blit(x, (bx + (bw - x.get_width()) // 2, yy))
+                yy += x.get_height() + 6
+            dirty = True
         if rx.kicked:
             t = big.render(rx.status, True, (255, 220, 120))
             screen.blit(t, t.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2)))

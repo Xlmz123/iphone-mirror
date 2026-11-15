@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 6          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 7          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -207,6 +207,14 @@ class WinHid:
         self.generation = 0
         self.readvertising = False
         self.connected_event = asyncio.Event()
+        # Pairing: Windows doesn't always show its own "pair device?" prompt when the
+        # iPhone starts pairing, so we start it from the PC and ask in the viewer instead.
+        self.can_ask = lambda: False        # set by Service: is a viewer there to ask?
+        self.pair_state: dict | None = None # {"phone", "pin"} while waiting for the user
+        self._pair_args = None
+        self._pair_deferral = None
+        self._pair_tried: dict[str, float] = {}
+        self.pairing_busy = False
 
     # ---- state for the viewer
     @property
@@ -458,9 +466,12 @@ class WinHid:
             for d in await DeviceInformation.find_all_async_aqs_filter(sel):
                 try:
                     paired = d.pairing.is_paired
+                    can = d.pairing.can_pair
                 except (OSError, AttributeError):
-                    paired = "?"
+                    paired, can = "?", False
                 seen.append(f"{kind} '{d.name}' paired={paired}")
+                if kind == "LE" and paired is False and can and not self.clients:
+                    asyncio.ensure_future(self._pair(d))
         text = "; ".join(sorted(seen)) or "none"
         if text != getattr(self, "_last_links", None):
             self._last_links = text
@@ -526,6 +537,73 @@ class WinHid:
             log("connected:", cl["id"], f"(details unavailable: {e})")
         finally:
             cl["tuning"] = False
+
+    async def _pair(self, d) -> None:
+        """Pair with a connected, unpaired device from the PC side, asking the user in the
+        viewer to compare the 6-digit code (never automatically: a stranger's phone could
+        connect too)."""
+        now = time.monotonic()
+        if self.pairing_busy or not self.can_ask() or now - self._pair_tried.get(d.id, -1e9) < 45:
+            return
+        self._pair_tried[d.id] = now
+        self.pairing_busy = True
+        from winrt.windows.devices.enumeration import (DevicePairingKinds as K,
+                                                        DevicePairingProtectionLevel as L,
+                                                        DevicePairingResultStatus as R)
+        name = d.name or "a phone"
+        custom = d.pairing.custom
+        token = custom.add_pairing_requested(
+            lambda sender, args: self.loop.call_soon_threadsafe(self._on_pair_request, name, args, args.get_deferral()))
+        log(f"'{name}' is connected but not paired: pairing from the PC")
+        try:
+            r = await custom.pair_async(K.CONFIRM_ONLY | K.CONFIRM_PIN_MATCH | K.DISPLAY_PIN, L.ENCRYPTION)
+            try:
+                result = R(r.status).name
+            except ValueError:
+                result = str(r.status)
+            log(f"pairing with '{name}': {result}")
+        except Exception as e:
+            log(f"pairing with '{name}' failed: {e!r}")
+        finally:
+            try:
+                custom.remove_pairing_requested(token)
+            except Exception:
+                pass
+            self.answer_pairing(False)          # nothing left waiting
+            self.pairing_busy = False
+            self.changed()
+
+    def _on_pair_request(self, name: str, args, deferral) -> None:
+        try:
+            pin = args.pin or ""
+        except (OSError, AttributeError):
+            pin = ""
+        log(f"pairing request for '{name}' (kind {int(args.pairing_kind)}, code {pin or 'none'}): asking in the viewer")
+        self._pair_args, self._pair_deferral = args, deferral
+        self.pair_state = {"phone": name, "pin": pin}
+        self.changed()
+        self.loop.call_later(60, lambda a=args: self._pair_args is a and self.answer_pairing(False))
+
+    def answer_pairing(self, yes: bool) -> None:
+        args, deferral = self._pair_args, self._pair_deferral
+        if args is None:
+            return
+        self._pair_args = self._pair_deferral = None
+        self.pair_state = None
+        try:
+            if yes:
+                args.accept()
+                log("pairing accepted in the viewer")
+            else:
+                log("pairing declined / timed out")
+        except Exception as e:
+            log(f"accepting the pairing failed: {e!r}")
+        finally:
+            try:
+                deferral.complete()
+            except Exception:
+                pass
+            self.changed()
 
     def _ask_fast(self, cl: dict) -> None:
         """Ask for short connection intervals (iOS otherwise often sits at 30 ms)."""
@@ -610,6 +688,13 @@ class FakeHid:
         self.sent: list = []
         self.last = 0.0
         self.lock = asyncio.Lock()
+        self.can_ask = lambda: False
+        self.pair_state = os.environ.get("MIRRORLINK_FAKE_PAIR") and {"phone": "Test iPhone", "pin": "123456"} or None
+
+    def answer_pairing(self, yes: bool) -> None:
+        log("fake pairing answered:", yes)
+        self.pair_state = None
+        self.changed()
 
     async def start(self) -> None:
         self.changed()
@@ -1038,7 +1123,7 @@ class Service:
                 "phone": self.hid.phone, "problem": self.hid.problem,
                 "pc": os.environ.get("COMPUTERNAME", "this PC"),
                 "interval_ms": self.hid.interval_ms, "skipped_chars": self.engine.skipped_chars,
-                "version": VERSION}
+                "version": VERSION, "pairing": getattr(self.hid, "pair_state", None)}
 
     def push_status(self, force: bool = False) -> None:
         s = self.status()
@@ -1146,6 +1231,8 @@ class Service:
                 e.wheel_max = min(80.0, max(5.0, float(cfg["wheel_max"])))
         elif cmd == "status":
             self.push_status(force=True)
+        elif cmd == "pair":
+            self.hid.answer_pairing(a[:1] == ["yes"])
         elif cmd == "bye":
             pass                                  # the disconnect that follows does the rest
         elif cmd == "restart":
@@ -1206,6 +1293,7 @@ async def amain(fake: bool) -> int:
     hid = FakeHid(loop, changed) if fake else WinHid(loop, changed)
     engine = Engine(hid)
     holder["svc"] = svc = Service(hid, engine, token)
+    hid.can_ask = lambda: svc.writer is not None
     log("MirrorLink Bluetooth control started" + (" (fake, no Bluetooth)" if fake else ""))
     async with server:
         await asyncio.gather(server.serve_forever(), hid.start(), hid.watch(), engine.run(), svc.watchdog())

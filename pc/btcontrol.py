@@ -72,6 +72,8 @@ class BtControl:
                 return "Control (Bluetooth): getting Bluetooth support ready (first time takes a minute)…"
             return "Control (Bluetooth): starting…"
         s = self.status
+        if s.get("pairing"):
+            return "Control (Bluetooth): pairing — compare the code (box in the middle)"
         if s.get("problem"):
             return "Control (Bluetooth): " + s["problem"]
         if not s.get("published"):
@@ -96,6 +98,15 @@ class BtControl:
                     pass
                 self.sock = None
                 return False
+
+    @property
+    def pairing(self) -> dict | None:
+        """{"phone", "pin"} while the PC waits for the user to confirm a pairing code."""
+        return self.status.get("pairing") if self.connected_service else None
+
+    def answer_pairing(self, yes: bool) -> None:
+        self.send("pair yes" if yes else "pair no")
+        self.status = dict(self.status, pairing=None)
 
     def take_over(self) -> None:
         """F5: reconnect (and take control back from another viewer window). Doesn't
