@@ -111,7 +111,9 @@ final class H264Encoder {
         return true
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+    /// `forceKey`: make this frame a keyframe now, ignoring the keyframe throttle.
+    /// Used when the screen is static and this is the only frame that will be sent.
+    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKey: Bool = false) {
         let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
         if session == nil || w != width || h != height {
@@ -123,7 +125,7 @@ final class H264Encoder {
         // Keyframes are big; never force more than ~3 per second, or a struggling
         // link gets buried in them. A pending request waits for the next slot.
         let now = CACurrentMediaTime()
-        let key = forceKeyframe && now - lastForcedKey >= 0.3
+        let key = forceKey || (forceKeyframe && now - lastForcedKey >= 0.3)
         if key { forceKeyframe = false; lastForcedKey = now }
         let dirty = bitrateDirty
         bitrateDirty = false
