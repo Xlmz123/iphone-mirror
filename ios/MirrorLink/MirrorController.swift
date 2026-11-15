@@ -24,6 +24,7 @@ final class MirrorController: NSObject, ObservableObject {
 
     @Published var events: [String] = []
     @Published var jpegMode = false
+    @Published var controlReady = false
 
     private let engine: CaptureEngine
     private let keepAlive = KeepAlive()
@@ -45,6 +46,7 @@ final class MirrorController: NSObject, ObservableObject {
         keepAlive.onLog = { [weak self] msg in self?.log(msg) }
         engine.onLog = { [weak self] msg in Task { @MainActor in self?.log(msg) } }
         engine.onMode = { [weak self] on in Task { @MainActor in self?.jpegMode = on } }
+        engine.onControlReady = { [weak self] on in Task { @MainActor in self?.controlReady = on } }
 
         engine.onServerStatus = { [weak self] msg in
             Task { @MainActor in self?.status = msg }

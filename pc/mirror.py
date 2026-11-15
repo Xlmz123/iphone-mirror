@@ -37,7 +37,8 @@ USB_PORT = 47800
 WIFI_PORT = 47801
 HEADER = struct.Struct(">IBQ")   # length, type, timestamp(us)
 
-MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_JPEG, MSG_PAIR_INFO = 0x01, 0x02, 0x03, 0x04, 0x21
+MSG_HELLO, MSG_KEY, MSG_DELTA, MSG_JPEG, MSG_ORIENT = 0x01, 0x02, 0x03, 0x04, 0x05
+MSG_PAIR_INFO, MSG_KICKED, MSG_INPUT, MSG_INPUT_STATUS = 0x21, 0x22, 0x30, 0x31
 MSG_REQ_KEY, MSG_PING, MSG_PONG, MSG_ACK, MSG_CONFIG, MSG_PAIR_REQ = 0x10, 0x11, 0x12, 0x13, 0x14, 0x20
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -114,6 +115,11 @@ class Receiver(threading.Thread):
         self.note_until = 0.0
         self.count = {"key": 0, "delta": 0, "jpeg": 0, "frames": 0, "errors": 0}   # totals this session
         self.mode = "H.264"
+        self.orientation_raw = None          # phone's SCStreamFrameInfo.videoOrientation value
+        self.control_ready = False           # control helper (WDA) reachable on the phone
+        self.connected_at = 0.0
+        self.kicked = False                  # another viewer took over
+        self.resume = threading.Event()
 
     @property
     def connected(self) -> bool:
@@ -124,8 +130,20 @@ class Receiver(threading.Thread):
             f, self._latest = self._latest, None
         return f
 
+    def send_input(self, event: dict) -> bool:
+        """Send a touch/key/text event to the phone. Returns False if not connected."""
+        link = self.link
+        if link is None:
+            return False
+        try:
+            send_msg(link, MSG_INPUT, json.dumps(event, separators=(",", ":")).encode())
+            return True
+        except OSError:
+            return False
+
     def stop(self) -> None:
         self._stop.set()
+        self.resume.set()
         if self.link:
             self.link.close()
 
@@ -195,6 +213,8 @@ class Receiver(threading.Thread):
 
             self.link = link
             self.link_kind = link.kind
+            self.connected_at = time.time()
+            self.control_ready = False
             self.status = ("Connected over " + ("USB" if link.kind == "usb" else "Wi-Fi") +
                            " — tap Start Mirroring on the phone")
             try:
@@ -207,7 +227,16 @@ class Receiver(threading.Thread):
             finally:
                 self.link_kind = None
                 self.link = None
+                self.control_ready = False
                 link.close()
+            if self.kicked:
+                # Another viewer took over. Don't fight it: wait for the user.
+                self.status = ("Another MirrorLink viewer took over this iPhone. "
+                               "Press R in this window to take it back.")
+                self.resume.clear()
+                self.resume.wait()
+                self.kicked = False
+                continue
             self._stop.wait(0.5)
 
     # ---- streaming ----------------------------------------------------------
@@ -336,6 +365,22 @@ class Receiver(threading.Thread):
                                                          info.get("name", "iPhone"), old_host)
                     self.pairing.save()
 
+                elif mtype == MSG_ORIENT:
+                    try:
+                        self.orientation_raw = json.loads(payload).get("o")
+                    except ValueError:
+                        pass
+
+                elif mtype == MSG_INPUT_STATUS:
+                    try:
+                        self.control_ready = bool(json.loads(payload).get("ready"))
+                    except ValueError:
+                        pass
+
+                elif mtype == MSG_KICKED:
+                    self.kicked = True
+                    raise ConnectionError("another viewer took over")
+
                 elif mtype == MSG_PONG:
                     (sent,) = struct.unpack(">d", payload[:8])
                     with self.stats.lock:
@@ -345,6 +390,20 @@ class Receiver(threading.Thread):
 
 
 # ----------------------------------------------------------------------------- UI
+
+import numpy as np  # noqa: E402  (PyAV already depends on it)
+
+from helper import ControlHelper  # noqa: E402
+
+TOP_BAR = 34          # strip above the phone picture for the Home / App Switcher buttons (like macOS)
+
+# Rotation (degrees clockwise) that makes the picture upright, keyed by the phone's
+# reported orientation value. iOS tags frames like EXIF / CGImagePropertyOrientation:
+# 1 = upright, 3 = upside down, 6 = needs 90° clockwise, 8 = needs 90° counter-clockwise.
+# Override in settings.json with "orientation_map": {"<value>": degrees} if needed,
+# or press Ctrl+R to rotate by hand.
+DEFAULT_ORIENTATION_MAP = {"1": 0, "2": 0, "3": 180, "4": 180, "5": 90, "6": 90, "7": 270, "8": 270}
+
 
 def enable_dpi_awareness() -> None:
     if sys.platform == "win32":
@@ -361,8 +420,165 @@ def fit(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int, int, 
     return (box_w - w) // 2, (box_h - h) // 2, w, h
 
 
+def rotation_for(raw, overrides: dict) -> int:
+    if raw is None:
+        return 0
+    table = dict(DEFAULT_ORIENTATION_MAP)
+    for k, v in (overrides or {}).items():
+        try:
+            table[str(k)] = int(v)
+        except (TypeError, ValueError):
+            pass
+    return int(table.get(str(raw), 0)) % 360
+
+
+def clipboard_text() -> str:
+    try:
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        t = pygame.scrap.get_text()
+        if t:
+            return t
+    except Exception:
+        pass
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        t = r.clipboard_get()
+        r.destroy()
+        return t
+    except Exception:
+        return ""
+
+
+class InputController:
+    """Turns mouse and keyboard into iPhone gestures, the way macOS iPhone Mirroring does:
+
+    click = tap · click-and-hold or right-click = long press · click-drag = swipe/drag
+    scroll wheel / trackpad = scroll · typing = typing · Ctrl+1/2/3/4 = Home / App Switcher /
+    Search / Control Center (macOS uses Cmd).
+    Coordinates are sent normalized (0..1) in the upright picture you see.
+    """
+
+    TAP_SLOP = 0.012       # how far (fraction of screen) a press can move and still be a tap
+    LONG_MS = 550          # hold this long without moving = long press (iOS context menus)
+
+    def __init__(self, rx: "Receiver", note) -> None:
+        self.rx = rx
+        self.note = note
+        self.down = None
+        self.text = ""
+        self.text_t = 0.0
+        self.wheel = [0.0, 0.0]
+        self.wheel_pos = (0.5, 0.5)
+        self.wheel_t = 0.0
+        self.ripples: list[tuple[float, float, float]] = []   # (nx, ny, t) tap feedback
+
+    def send(self, ev: dict) -> None:
+        if not self.rx.connected:
+            return
+        if not self.rx.control_ready:
+            self.note("Control isn't ready yet (see the status at the top-left, F1)")
+        self.rx.send_input(ev)
+
+    # --- pointer --------------------------------------------------------------
+    def press(self, nx: float, ny: float) -> None:
+        self.down = {"x": nx, "y": ny, "t0": time.perf_counter(), "pts": [[nx, ny, 0.0]],
+                     "drag": False, "long": False}
+
+    def motion(self, nx: float, ny: float) -> None:
+        d = self.down
+        if not d or d["long"]:
+            return
+        t = (time.perf_counter() - d["t0"]) * 1000
+        lx, ly, lt = d["pts"][-1]
+        if abs(nx - lx) + abs(ny - ly) > 0.002 and t - lt >= 8:
+            d["pts"].append([nx, ny, t])
+        if abs(nx - d["x"]) > self.TAP_SLOP or abs(ny - d["y"]) > self.TAP_SLOP:
+            d["drag"] = True
+
+    def release(self, nx: float, ny: float) -> None:
+        d, self.down = self.down, None
+        if not d or d["long"]:
+            return
+        t = (time.perf_counter() - d["t0"]) * 1000
+        if d["drag"]:
+            pts = d["pts"] + [[nx, ny, t]]
+            self.send({"t": "path", "pts": self._simplify(pts)})
+        else:
+            self.send({"t": "tap", "x": d["x"], "y": d["y"]})
+            self.ripples.append((d["x"], d["y"], time.perf_counter()))
+
+    def right_click(self, nx: float, ny: float) -> None:
+        self.send({"t": "long", "x": nx, "y": ny, "ms": 800})
+        self.ripples.append((nx, ny, time.perf_counter()))
+
+    @staticmethod
+    def _simplify(pts: list) -> list:
+        # Keep the shape and real timing, but cap the size (≤ 40 points, ≤ 4 s).
+        if len(pts) > 40:
+            step = (len(pts) - 1) / 39
+            pts = [pts[round(i * step)] for i in range(40)]
+        total = pts[-1][2]
+        if total > 4000:
+            k = 4000 / total
+            pts = [[x, y, t * k] for x, y, t in pts]
+        return [[round(x, 4), round(y, 4), round(t)] for x, y, t in pts]
+
+    def wheel_event(self, dx: float, dy: float, pos) -> None:
+        if pos is None:
+            return
+        self.wheel[0] += dx
+        self.wheel[1] += dy
+        self.wheel_pos = pos
+        self.wheel_t = time.perf_counter()
+
+    def _flush_wheel(self) -> None:
+        dx, dy = self.wheel
+        self.wheel = [0.0, 0.0]
+        if abs(dx) < 0.05 and abs(dy) < 0.05:
+            return
+        step = 0.10                                   # screen fraction per wheel notch
+        ddx = max(-0.6, min(0.6, -dx * step))         # scroll right = finger moves left
+        ddy = max(-0.6, min(0.6, dy * step))          # wheel up = content moves down = finger moves down
+        x, y = self.wheel_pos
+        x = min(0.95 - max(0, ddx), max(0.05 - min(0, ddx), x))
+        y = min(0.93 - max(0, ddy), max(0.07 - min(0, ddy), y))
+        fling = max(abs(dx), abs(dy)) >= 4            # fast spin = flick with momentum
+        dur = 90 if fling else 140
+        pts = [[x + ddx * i / 4, y + ddy * i / 4, dur * i / 4] for i in range(5)]
+        if not fling:
+            pts.append([x + ddx, y + ddy, dur + 70])  # pause before lifting: no momentum, precise
+        self.send({"t": "path", "pts": self._simplify(pts)})
+
+    # --- keyboard -------------------------------------------------------------
+    def type_text(self, s: str) -> None:
+        if not self.text:
+            self.text_t = time.perf_counter()
+        self.text += s
+
+    def key(self, k: str) -> None:
+        self.send({"t": "key", "k": k})
+
+    # --- called every loop ----------------------------------------------------
+    def tick(self) -> None:
+        now = time.perf_counter()
+        d = self.down
+        if d and not d["drag"] and not d["long"] and (now - d["t0"]) * 1000 >= self.LONG_MS:
+            d["long"] = True                       # held still: long press now, like iOS
+            self.send({"t": "long", "x": d["x"], "y": d["y"], "ms": 750})
+            self.ripples.append((d["x"], d["y"], now))
+        if self.wheel != [0.0, 0.0] and now - self.wheel_t > 0.08:
+            self._flush_wheel()
+        if self.text and now - self.text_t > 0.04:
+            s, self.text = self.text, ""
+            self.send({"t": "text", "s": s})
+        self.ripples = [r for r in self.ripples if now - r[2] < 0.35]
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Show your iPhone's screen on this PC.")
+    ap = argparse.ArgumentParser(description="Show and control your iPhone from this PC.")
     ap.add_argument("--host", help="phone's Wi-Fi IP address (skips auto-discovery)")
     ap.add_argument("--usb-only", action="store_true", help="never use Wi-Fi")
     ap.add_argument("--forget", action="store_true", help="delete this PC's pairing and exit")
@@ -376,112 +592,337 @@ def main() -> None:
     pygame.init()
     pygame.display.set_caption("MirrorLink")
     info = pygame.display.Info()
-    desk_h = info.current_h or 1080
-    win_h = int(desk_h * 0.85)
-    win_w = int(win_h * 9 / 19.5)          # typical iPhone aspect until we know the real one
+    desk_w, desk_h = (info.current_w or 1920), (info.current_h or 1080)
+    win_scale = 1.0
+
+    def window_size_for(pw: int, ph: int, rot: int) -> tuple[int, int]:
+        w, h = (ph, pw) if rot in (90, 270) else (pw, ph)
+        long_side = desk_h * 0.82 * win_scale
+        if h >= w:
+            H = long_side
+            W = H * w / h
+        else:
+            W = min(long_side * 1.15, desk_w * 0.95)
+            H = W * h / w
+        return max(240, int(W)), max(240, int(H) + TOP_BAR)
+
+    win_w, win_h = window_size_for(9, 19.5, 0)
     screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
-    font = pygame.font.SysFont("segoeui,arial", 16)
-    big = pygame.font.SysFont("segoeui,arial", 20)
+    pygame.key.start_text_input()
+    font = pygame.font.SysFont("segoeui,arial", 15)
+    big = pygame.font.SysFont("segoeui,arial", 19)
+    btn_font = pygame.font.SysFont("segoeui,arial", 14, bold=True)
 
     stats = Stats()
     rx = Receiver(stats, host=args.host, usb_only=args.usb_only)
     rx.start()
+    helper = ControlHelper()
+    auto_tried_for = 0.0
+    go_home_after_launch = False   # WDA's blank screen comes to the front when it starts
 
+    notes: list[tuple[str, float]] = []
+    def note(msg: str) -> None:
+        if not notes or notes[-1][0] != msg:
+            notes.append((msg, time.time() + 3))
+
+    ctl = InputController(rx, note)
     show_stats = True
     fullscreen = False
-    sized_for: tuple[int, int] | None = None
-    last_surface: pygame.Surface | None = None
-    last_rect = (0, 0, 0, 0)
+    manual_rot = 0
+    sized_for = None
+    last_surface = None
+    last_rect = (0, TOP_BAR, 0, 0)
+    last_frame = None
     running = True
     last_draw = 0.0
     max_frames = int(os.environ.get("MIRRORLINK_EXIT_AFTER_FRAMES", "0"))  # for automated tests
 
+    cfg_cache = {"mtime": None, "map": {}}
+
+    def current_rotation() -> int:
+        m = settings_mtime()
+        if m != cfg_cache["mtime"]:                   # re-read settings.json only when saved
+            cfg_cache["mtime"] = m
+            cfg_cache["map"] = load_settings().get("orientation_map", {})
+        return (rotation_for(rx.orientation_raw, cfg_cache["map"]) + manual_rot) % 360
+
+    def image_area() -> tuple[int, int, int, int]:
+        sw, sh = screen.get_size()
+        top = 0 if fullscreen else TOP_BAR
+        return 0, top, sw, sh - top
+
+    def to_norm(pos):
+        x, y, w, h = last_rect
+        if w <= 0 or h <= 0:
+            return None
+        nx, ny = (pos[0] - x) / w, (pos[1] - y) / h
+        if 0 <= nx <= 1 and 0 <= ny <= 1:
+            return nx, ny
+        return None
+
+    def bar_buttons():
+        """Home and App Switcher buttons in the top strip (right side), like macOS."""
+        sw = screen.get_width()
+        h = TOP_BAR - 10
+        apps = pygame.Rect(sw - 8 - 104, 5, 104, h)
+        home = pygame.Rect(apps.left - 6 - 64, 5, 64, h)
+        return {"home": home, "switcher": apps}
+
+    def home_zone():
+        x, y, w, h = last_rect
+        zh = max(10, int(h * 0.025))
+        return pygame.Rect(x, y + h - zh, w, zh)
+
+    def set_window(size):
+        nonlocal screen, win_w, win_h
+        win_w, win_h = size
+        if not fullscreen:
+            screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+
     while running:
+        dirty = False
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
             elif ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
+                # Ctrl shortcuts (Cmd on a Mac keyboard). Ctrl+Alt is AltGr on many
+                # layouts (e.g. AltGr+Q = @), so that's typing, not a shortcut.
+                ctrl = bool(ev.mod & (pygame.KMOD_CTRL | pygame.KMOD_META)) and not (ev.mod & pygame.KMOD_ALT)
+                if ctrl and ev.key == pygame.K_q:
                     running = False
+                elif ctrl and ev.key in (pygame.K_1, pygame.K_h):
+                    ctl.key("home")
+                elif ctrl and ev.key == pygame.K_2:
+                    ctl.key("switcher")
+                elif ctrl and ev.key == pygame.K_3:
+                    ctl.key("spotlight")
+                elif ctrl and ev.key == pygame.K_4:
+                    ctl.key("control")
+                elif ctrl and ev.key == pygame.K_5:
+                    ctl.key("notifications")
+                elif ctrl and ev.key == pygame.K_UP:
+                    ctl.key("volup")
+                elif ctrl and ev.key == pygame.K_DOWN:
+                    ctl.key("voldown")
+                elif ctrl and ev.key == pygame.K_v:
+                    t = clipboard_text()
+                    if t:
+                        ctl.type_text(t.replace("\r\n", "\n"))
+                elif ctrl and ev.key == pygame.K_r:
+                    manual_rot = (manual_rot + 90) % 360
+                    sized_for = None
+                    note(f"Rotated view ({manual_rot}° extra). Ctrl+R again to keep turning.")
+                elif ctrl and ev.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                    win_scale = min(1.6, win_scale + 0.1); sized_for = None
+                elif ctrl and ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    win_scale = max(0.4, win_scale - 0.1); sized_for = None
+                elif ctrl and ev.key in (pygame.K_0, pygame.K_KP0):
+                    win_scale = 1.0; sized_for = None
                 elif ev.key == pygame.K_F1:
                     show_stats = not show_stats
+                elif ev.key == pygame.K_F5:
+                    if rx.link_kind != "usb":
+                        note("Plug in the USB cable to start the control helper")
+                    elif helper.start("manual"):
+                        note("Starting the control helper…")
                 elif ev.key == pygame.K_F11:
                     fullscreen = not fullscreen
                     screen = pygame.display.set_mode(
                         (0, 0) if fullscreen else (win_w, win_h),
                         pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE)
                     last_surface = None
-                    last_draw = 0.0
+                elif ev.key == pygame.K_r and rx.kicked and not ctrl:
+                    rx.resume.set()
+                elif not ctrl:
+                    if ev.key == pygame.K_BACKSPACE:
+                        ctl.type_text("\b")
+                    elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        ctl.type_text("\n")
+                    elif ev.key == pygame.K_TAB:
+                        ctl.type_text("\t")
+            elif ev.type == pygame.TEXTINPUT:
+                if not rx.kicked:
+                    ctl.type_text(ev.text)
+            elif ev.type == pygame.MOUSEBUTTONDOWN:
+                if ev.button == 1:
+                    hit = next((k for k, r in bar_buttons().items() if r.collidepoint(ev.pos)), None)
+                    if hit and not fullscreen and ev.pos[1] < TOP_BAR:
+                        ctl.key(hit)
+                    elif home_zone().collidepoint(ev.pos):
+                        ctl.key("home")             # the home bar, like on macOS
+                    else:
+                        p = to_norm(ev.pos)
+                        if p:
+                            ctl.press(*p)
+                elif ev.button == 3:
+                    p = to_norm(ev.pos)
+                    if p:
+                        ctl.right_click(*p)
+                dirty = True
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                x, y, w, h = last_rect
+                nx = min(1, max(0, (ev.pos[0] - x) / w)) if w else 0
+                ny = min(1, max(0, (ev.pos[1] - y) / h)) if h else 0
+                ctl.release(nx, ny)
+                dirty = True
+            elif ev.type == pygame.MOUSEMOTION:
+                if ctl.down:
+                    x, y, w, h = last_rect
+                    if w and h:
+                        ctl.motion(min(1, max(0, (ev.pos[0] - x) / w)), min(1, max(0, (ev.pos[1] - y) / h)))
+                dirty = True                         # hover bar / home pill
+            elif ev.type == pygame.MOUSEWHEEL:
+                p = to_norm(pygame.mouse.get_pos())
+                dx = getattr(ev, "precise_x", ev.x)
+                dy = getattr(ev, "precise_y", ev.y)
+                if getattr(ev, "flipped", False):
+                    dx, dy = -dx, -dy
+                ctl.wheel_event(dx, dy, p)
             elif ev.type == pygame.VIDEORESIZE and not fullscreen:
                 win_w, win_h = ev.w, ev.h
                 last_surface = None
-                last_draw = 0.0
+                dirty = True
 
-        # Resize the window once to the phone's real aspect ratio.
-        if rx.size and rx.size != sized_for and not fullscreen:
-            pw, ph = rx.size
-            win_h = int(desk_h * 0.85)
-            win_w = int(win_h * pw / ph)
-            screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
-            sized_for = rx.size
+        ctl.tick()
+
+        # Start the control helper automatically (USB only, once per connection).
+        if (rx.connected and rx.link_kind == "usb" and not rx.control_ready and not helper.busy
+                and rx.connected_at != auto_tried_for and time.time() - rx.connected_at > 4):
+            auto_tried_for = rx.connected_at
+            helper.start("auto")
+        if helper.status.startswith("Control: helper started"):
+            go_home_after_launch = True
+        if go_home_after_launch and rx.control_ready:
+            go_home_after_launch = False
+            helper.status = ""
+            ctl.key("home")
+            note("Control ready: click to tap, drag to swipe, type to type")
+
+        # Resize the window to the phone's real aspect ratio / orientation.
+        rot = current_rotation()
+        if rx.size and (rx.size, rot, win_scale) != sized_for and not fullscreen:
+            set_window(window_size_for(rx.size[0], rx.size[1], rot))
+            sized_for = (rx.size, rot, win_scale)
+            last_surface = None
+            dirty = True
 
         got = rx.new_frame.wait(0.004)
         frame = rx.latest() if got else None
         if got:
             rx.new_frame.clear()
-
         if frame is not None:
-            sw, sh = screen.get_size()
-            x, y, w, h = fit(frame.width, frame.height, sw, sh)
-            rgb = frame.to_ndarray(format="rgb24", width=w, height=h, interpolation="BILINEAR")
+            last_frame = frame
+        if (frame is not None or (last_surface is None and last_frame is not None)) and last_frame is not None:
+            f = last_frame
+            ax, ay, aw, ah = image_area()
+            rw, rh = (f.height, f.width) if rot in (90, 270) else (f.width, f.height)
+            x, y, w, h = fit(rw, rh, aw, ah)
+            sw_, sh_ = (h, w) if rot in (90, 270) else (w, h)     # size before rotation
+            rgb = f.to_ndarray(format="rgb24", width=sw_, height=sh_, interpolation="BILINEAR")
+            if rot:
+                rgb = np.ascontiguousarray(np.rot90(rgb, k=-(rot // 90)))
             last_surface = pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
-            last_rect = (x, y, w, h)
-            with stats.lock:
-                stats.shown += 1
-            if max_frames:
-                max_frames -= 1
-                if max_frames == 0:
-                    running = False
+            last_rect = (ax + x, ay + y, w, h)
+            if frame is not None:
+                with stats.lock:
+                    stats.shown += 1
+                if max_frames:
+                    max_frames -= 1
+                    if max_frames == 0:
+                        running = False
+            dirty = True
 
         stats.tick()
         now = time.perf_counter()
-        if frame is None and now - last_draw < 0.25:
-            continue          # nothing new: don't burn CPU redrawing
+        if not dirty and not ctl.ripples and now - last_draw < 0.25:
+            continue
         last_draw = now
+
+        # ---- draw -------------------------------------------------------------
         screen.fill((12, 12, 14))
+        mouse = pygame.mouse.get_pos()
         if last_surface is not None:
             screen.blit(last_surface, last_rect[:2])
         else:
             msg = big.render(rx.status, True, (220, 220, 225))
             screen.blit(msg, msg.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2)))
 
+        # Top strip: Home / App Switcher buttons appear on hover (like macOS).
+        if not fullscreen and mouse[1] < TOP_BAR + 6 and pygame.mouse.get_focused():
+            for name, r in bar_buttons().items():
+                hover = r.collidepoint(mouse)
+                pygame.draw.rect(screen, (70, 70, 78) if hover else (44, 44, 50), r, border_radius=7)
+                label = btn_font.render("Home" if name == "home" else "App Switcher", True, (235, 235, 240))
+                screen.blit(label, label.get_rect(center=r.center))
+            hint = font.render("Ctrl+1 Home · Ctrl+2 Apps · Ctrl+3 Search", True, (130, 130, 140))
+            screen.blit(hint, (10, (TOP_BAR - hint.get_height()) // 2))
+
+        # Home bar at the bottom of the phone picture: highlight on hover, click = Home.
+        if last_surface is not None and home_zone().collidepoint(mouse):
+            hz = home_zone()
+            pill = pygame.Rect(0, 0, int(last_rect[2] * 0.36), max(5, hz.height // 2))
+            pill.center = hz.center
+            pygame.draw.rect(screen, (245, 245, 250), pill, border_radius=4)
+
+        # Tap feedback.
+        x0, y0, w0, h0 = last_rect
+        for nx, ny, t in ctl.ripples:
+            a = min(1.0, max(0.0, (now - t) / 0.35))
+            r = int(10 + 18 * a)
+            surf = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (255, 255, 255, int(160 * (1 - a))), (r + 1, r + 1), r, 3)
+            screen.blit(surf, (x0 + nx * w0 - r - 1, y0 + ny * h0 - r - 1))
+
+        # Status / stats overlay.
         if show_stats:
             s = stats.snapshot
             rtt = f"{s['rtt_ms']:.1f} ms" if s["rtt_ms"] is not None else "–"
+            if rx.control_ready:
+                control = "Control: ready"
+            elif helper.status:
+                control = helper.status
+            elif rx.connected and rx.link_kind != "usb":
+                control = "Control: not running — plug in the USB cable once to start it"
+            else:
+                control = "Control: not ready (F5 to start)"
             lines = [
                 f"{rx.device_name or 'iPhone'} · "
                 f"{ {'usb': 'USB', 'wifi': 'Wi-Fi (encrypted)'}.get(rx.link_kind or '', 'not connected') }"
                 f"{' · paired' if rx.pairing else ''}",
-                f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps",
+                f"video {s['rx_fps']} fps · shown {s['show_fps']} fps · {s['mbps']:.1f} Mbps · {rx.mode}",
                 f"decode {s['decode_ms']:.1f} ms · round trip {rtt}"
-                f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}",
-                f"mode {rx.mode} · received {rx.count['key']} key + {rx.count['delta']} other"
-                f"{' + ' + str(rx.count['jpeg']) + ' jpeg' if rx.count['jpeg'] else ''} · "
-                f"decoded {rx.count['frames']} · errors {rx.count['errors']}",
+                f"{' · ' + str(rx.size[0]) + '×' + str(rx.size[1]) if rx.size else ''}"
+                f" · orientation {rx.orientation_raw if rx.orientation_raw is not None else '–'} ({rot}°)",
+                control,
                 *([rx.status_note] if time.time() < rx.note_until else []),
-                "F1 stats · F11 fullscreen · Esc quit",
+                "F1 stats · F5 start control · F11 fullscreen · Ctrl+R rotate · Ctrl+Q quit",
             ]
-            pad = 8
-            surf = [font.render(t, True, (235, 235, 240)) for t in lines]
-            bw = max(t.get_width() for t in surf) + pad * 2
-            bh = sum(t.get_height() for t in surf) + pad * 2
+            pad = 7
+            surfs = [font.render(t, True, (235, 235, 240)) for t in lines]
+            bw = max(t.get_width() for t in surfs) + pad * 2
+            bh = sum(t.get_height() for t in surfs) + pad * 2
             box = pygame.Surface((bw, bh), pygame.SRCALPHA)
-            box.fill((0, 0, 0, 150))
-            screen.blit(box, (10, 10))
-            yy = 10 + pad
-            for t in surf:
-                screen.blit(t, (10 + pad, yy))
+            box.fill((0, 0, 0, 160))
+            bx, by = 8, (8 if fullscreen else TOP_BAR + 6)
+            screen.blit(box, (bx, by))
+            yy = by + pad
+            for t in surfs:
+                screen.blit(t, (bx + pad, yy))
                 yy += t.get_height()
+
+        # Toast notes (bottom).
+        tnow = time.time()
+        notes[:] = [n for n in notes if n[1] > tnow]
+        if notes:
+            t = font.render(notes[-1][0], True, (255, 255, 255))
+            r = t.get_rect(midbottom=(screen.get_width() // 2, screen.get_height() - 30))
+            bg = pygame.Surface((r.width + 20, r.height + 10), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 190))
+            screen.blit(bg, (r.x - 10, r.y - 5))
+            screen.blit(t, r)
+        if rx.kicked:
+            t = big.render(rx.status, True, (255, 220, 120))
+            screen.blit(t, t.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2)))
 
         pygame.display.flip()
 

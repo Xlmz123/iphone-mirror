@@ -3,3 +3,5 @@ pygame-ce>=2.5
 numpy>=1.26
 cryptography>=42
 zeroconf>=0.130
+# runs pymobiledevice3 (which starts the control helper) on its own Python 3.13
+uv>=0.5

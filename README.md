@@ -51,7 +51,7 @@ The first time the viewer connects over **USB**, it pairs with the phone and sav
    - **On Wi-Fi and you plug the cable in:** it switches to USB within a few seconds.
 3. You can leave the MirrorLink app on the phone. Mirroring keeps running in the background.
 
-**Viewer keys:** `F1` stats overlay · `F11` fullscreen · `Esc` quit
+**Viewer keys:** `F1` stats · `F5` start control · `F11` fullscreen · `Ctrl+Q` quit (full list under *Controlling the iPhone* below)
 
 **Away from home Wi-Fi?** Turn on the iPhone's **Personal Hotspot** and connect the PC to it. The mirroring stream stays on that local link and doesn't use mobile data. While connected, though, the PC's normal internet does go through your data plan.
 
@@ -67,6 +67,8 @@ Change a number, save the file, and the phone applies it within a second. No reb
 | `bitrate_usb` / `bitrate_wifi` | 1.0 / 0.6 | Picture quality. Lower it if video stutters. |
 | `max_queued_frames_usb` / `_wifi` | 4 / 6 | Frames allowed in flight before the phone skips ahead. Lower = snappier, more skipping. |
 | `keyframe_interval_s` | 3 | Seconds between full refresh frames. |
+| `jpeg_max_fps` / `jpeg_quality` | 60 / 0.6 | Frame rate and quality while the MirrorLink app is in the background. |
+| `orientation_map` | `{}` | Only if landscape shows sideways: e.g. `{"6": 270}`. The value shows in F1 stats. |
 
 The app's **Frames** line shows fps · frames skipped · keyframes per second, and the viewer's F1 overlay shows the stream resolution.
 
@@ -78,6 +80,42 @@ run.bat --forget              delete this PC's pairing
 ```
 
 ---
+
+## Controlling the iPhone from the PC
+
+Works like iPhone Mirroring on a Mac:
+
+| On the PC | On the iPhone |
+|---|---|
+| Click | Tap |
+| Click and hold, or right-click | Long press (context menus, Edit Home Screen) |
+| Click and drag | Swipe / drag |
+| Scroll wheel / trackpad | Scroll (spin fast to flick) |
+| Type | Types into the focused text field (Backspace, Enter work) |
+| Ctrl+V | Types your PC clipboard |
+| **Ctrl+1** or Ctrl+H, or click the bar at the bottom | Home Screen |
+| **Ctrl+2** | App Switcher |
+| **Ctrl+3** | Search |
+| **Ctrl+4** / Ctrl+5 | Control Center / Notifications |
+| Ctrl+↑ / Ctrl+↓ | Volume up / down |
+| Hover the top of the window | **Home** and **App Switcher** buttons |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Window bigger / smaller / normal |
+| Ctrl+R | Rotate the view by hand (if a landscape app shows sideways) |
+| F11 / Ctrl+Q | Fullscreen / quit |
+
+When the iPhone or an app turns landscape, the window turns with it.
+
+### One-time setup: the control helper
+Apps can't tap on other apps, so control uses **WebDriverAgent**, Appium's open-source helper built on Apple's UI-testing system. It's a second app on the phone.
+
+1. Download **WebDriverAgent-ipa** from the repo's **Actions** tab (run "Build control helper (WebDriverAgent)"), unzip it, and install `WebDriverAgent-unsigned.ipa` with **Sideloadly**, the same way as MirrorLink.
+2. Trust it like before: **Settings → General → VPN & Device Management** → your Apple ID → Trust.
+3. Run the viewer with the **USB cable** plugged in. It starts the helper automatically. The status at the top-left says what it's doing. **The first time takes a few minutes**, because it downloads Apple's developer tools for your iOS version and a small private Python. After that, it takes seconds.
+4. When it says **Control: ready**, click away. The helper keeps running after you unplug, so control works over Wi-Fi too, until the phone restarts. After a restart, plug in once again, or press **F5** while plugged in.
+
+**The helper only listens inside the phone**, not on your network. Your clicks reach it through MirrorLink's own connection: the cable, or encrypted Wi-Fi.
+
+If something goes wrong, the status line tells you what. Full details are in `pc/helper.log`.
 
 ## Security on Wi-Fi
 - **Pairing only over the cable.** A PC gets the phone's key only through USB, after you've tapped "Trust This Computer."
@@ -122,4 +160,6 @@ If Wi-Fi can't keep up, the phone **skips frames** instead of letting a delay bu
   - `pairing.py`: saves the key in `%APPDATA%\MirrorLink`.
 - `.github/workflows/build-ios.yml` + `ios/project.yml`: cloud build on GitHub's Xcode 27 Macs.
 
-**Next (input):** clicking, typing, and scrolling on the PC window controls the phone.
+- `ios/MirrorLink/InputBridge.swift`: passes your input to WebDriverAgent over the phone's loopback.
+- `pc/helper.py`: starts WebDriverAgent (mounts the developer disk image, then launches it with `USE_IP=127.0.0.1`).
+- `.github/workflows/build-wda.yml`: builds WebDriverAgent 17.0.6 unsigned, packaged like Appium's real-device release.
