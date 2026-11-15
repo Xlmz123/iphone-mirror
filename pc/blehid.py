@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 8          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 9          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -572,12 +572,25 @@ class WinHid:
             token = custom.add_pairing_requested(
                 lambda sender, args: self.loop.call_soon_threadsafe(self._on_pair_request, name, args, args.get_deferral()))
             log(f"'{name}' is connected but not paired: pairing from the PC")
-            r = await custom.pair_async(K.CONFIRM_ONLY | K.CONFIRM_PIN_MATCH | K.DISPLAY_PIN, L.ENCRYPTION)
-            try:
-                result = R(r.status).name
-            except ValueError:
-                result = str(r.status)
-            log(f"pairing with '{name}': {result}")
+
+            def outcome(r) -> str:
+                try:
+                    return R(r.status).name
+                except ValueError:
+                    return str(r.status)
+            ok = ("PAIRED", "ALREADY_PAIRED")
+            kinds = K.CONFIRM_ONLY | K.CONFIRM_PIN_MATCH | K.DISPLAY_PIN | K.PROVIDE_PIN
+            result = "not tried"
+            for level in (L.ENCRYPTION, L.DEFAULT, L.NONE):
+                result = outcome(await custom.pair_async(kinds, level))
+                log(f"pairing with '{name}' (ours, protection {int(level)}): {result}")
+                if result in ok or result == "PAIRING_CANCELED":
+                    break
+                await asyncio.sleep(0.5)
+            if result not in ok and result != "PAIRING_CANCELED":
+                # Last try: Windows' own pairing, which may show Windows' dialog.
+                result = outcome(await info.pairing.pair_async(L.DEFAULT))
+                log(f"pairing with '{name}' (Windows' own): {result}")
         except Exception as e:
             log(f"pairing with '{name}' failed: {e!r}")
         finally:
