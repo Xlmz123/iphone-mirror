@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 5          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 6          # the viewer restarts an older running copy (which means pairing again)
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -429,13 +429,42 @@ class WinHid:
 
     # ---- connected iPhones
     async def watch(self) -> None:
+        tick = 0
         while True:          # Windows doesn't always raise an event when a phone comes back
             await asyncio.sleep(1.0)
+            tick += 1
             if self.published:
                 try:
                     self.refresh()
                 except Exception as e:
                     log("checking connected iPhones failed:", e)
+            if tick % 3 == 0:
+                try:
+                    await self._log_links()
+                except Exception as e:
+                    if not getattr(self, "_links_failed", False):
+                        self._links_failed = True
+                        log("can't list Bluetooth connections:", repr(e))
+
+    async def _log_links(self) -> None:
+        """Diagnostics: which devices have a Bluetooth link to this PC (LE and Classic),
+        and whether Windows has them paired. Logged when it changes."""
+        from winrt.windows.devices.enumeration import DeviceInformation
+        W = self.w
+        import winrt.windows.devices.bluetooth as bt
+        seen = []
+        for kind, cls in (("LE", bt.BluetoothLEDevice), ("Classic", bt.BluetoothDevice)):
+            sel = cls.get_device_selector_from_connection_status(W["BluetoothConnectionStatus"].CONNECTED)
+            for d in await DeviceInformation.find_all_async_aqs_filter(sel):
+                try:
+                    paired = d.pairing.is_paired
+                except (OSError, AttributeError):
+                    paired = "?"
+                seen.append(f"{kind} '{d.name}' paired={paired}")
+        text = "; ".join(sorted(seen)) or "none"
+        if text != getattr(self, "_last_links", None):
+            self._last_links = text
+            log("Bluetooth links to this PC:", text)
 
     def refresh(self) -> None:
         g = self.g
