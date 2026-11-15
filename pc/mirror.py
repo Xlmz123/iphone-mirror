@@ -737,8 +737,8 @@ def main() -> None:
                 elif ev.key == pygame.K_F1:
                     show_stats = not show_stats
                 elif ev.key == pygame.K_F5 and use_bt:
-                    bt.restart()
-                    note("Restarting Bluetooth control…")
+                    bt.take_over()
+                    note("Reconnecting Bluetooth control…")
                 elif ev.key == pygame.K_F5:
                     if rx.link_kind != "usb":
                         note("Plug in the USB cable to start the control helper")
@@ -937,7 +937,7 @@ def main() -> None:
                 f" · orientation {rx.orientation_raw if rx.orientation_raw is not None else '–'} ({rot}°)",
                 control,
                 *([rx.status_note] if time.time() < rx.note_until else []),
-                ("F1 stats · F5 restart control · F11 fullscreen · Ctrl+K phone keyboard · Ctrl+R rotate · Ctrl+Q quit"
+                ("F1 stats · F5 reconnect control · F11 fullscreen · Ctrl+K phone keyboard · Ctrl+R rotate · Ctrl+Q quit"
                  if use_bt else "F1 stats · F5 start control · F11 fullscreen · Ctrl+R rotate · Ctrl+Q quit"),
             ]
             pad = 7

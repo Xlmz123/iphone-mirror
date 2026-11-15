@@ -53,6 +53,8 @@ class BtControl:
         self.stopping = False
         self.on_connect = None            # called (from the thread) after each (re)connect
         self.problem: str | None = None
+        self.kicked = False              # another MirrorLink window took over Bluetooth control
+        self.asked_restart = False
         threading.Thread(target=self._run, daemon=True, name="bt-control").start()
 
     # ---- what the viewer shows
@@ -61,6 +63,8 @@ class BtControl:
         return self.connected_service and bool(self.status.get("connected"))
 
     def status_line(self) -> str:
+        if self.kicked:
+            return "Control (Bluetooth): another MirrorLink window is using it (F5 to take it back)"
         if self.problem:
             return "Control (Bluetooth): " + self.problem
         if not self.connected_service:
@@ -93,8 +97,17 @@ class BtControl:
                 self.sock = None
                 return False
 
-    def restart(self) -> None:
-        self.send("restart")
+    def take_over(self) -> None:
+        """F5: reconnect (and take control back from another viewer window). Doesn't
+        restart the Bluetooth service: that can make the iPhone need pairing again."""
+        self.kicked = False
+        with self.lock:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
 
     def close(self) -> None:
         self.stopping = True
@@ -134,10 +147,18 @@ class BtControl:
             out = open(LOG, "a", encoding="utf-8")
             out.write(time.strftime("\n--- %Y-%m-%d %H:%M:%S starting\n"))
             out.flush()
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-            self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=str(HERE),
-                                         env=env, creationflags=flags)
+            # It keeps running after the viewer closes (see blehid.py), so detach it from
+            # this window's console and, where allowed, from any job that would end it.
+            base = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+            try:
+                extra = 0x01000000 if sys.platform == "win32" else 0      # CREATE_BREAKAWAY_FROM_JOB
+                self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=str(HERE),
+                                             env=env, creationflags=base | extra,
+                                             start_new_session=sys.platform != "win32")
+            except OSError:
+                self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=str(HERE),
+                                             env=env, creationflags=base)
             self.spawned_at = time.time()
             self.spawns += 1
         except OSError as e:
@@ -146,6 +167,9 @@ class BtControl:
     def _run(self) -> None:
         token = blehid.load_token()
         while not self.stopping:
+            if self.kicked:
+                time.sleep(0.3)
+                continue
             try:
                 s = socket.create_connection(("127.0.0.1", blehid.PORT), timeout=1.0)
             except OSError:
@@ -184,6 +208,12 @@ class BtControl:
                             self.status = json.loads(line[7:])
                         except ValueError:
                             pass
+                        # An older copy from before an update: start the new one (once).
+                        if self.status.get("version") != blehid.VERSION and not self.asked_restart:
+                            self.asked_restart = True
+                            self.send("restart")
+                    elif line == "kicked":
+                        self.kicked = True
             except OSError:
                 pass
             with self.lock:
@@ -377,8 +407,10 @@ class BtInput:
             self._swipe(0.88, 0.0, 0.88, 0.45, 0.6, 0.0)
         elif k == "notifications":
             self._swipe(0.15, 0.0, 0.15, 0.7, 0.6, 0.0)
-        elif k in ("volup", "voldown", "playpause", "mute"):
-            self.bt.send(f"consumer {k}")
+        elif k in ("volup", "voldown"):
+            self.note("Volume keys don't work over Bluetooth control — use the phone's buttons")
+        elif k == "siri":
+            self.bt.send("consumer siri")
         elif k == "keyboard":
             self.bt.send("consumer eject")                         # show/hide the on-screen keyboard
 

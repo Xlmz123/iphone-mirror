@@ -123,6 +123,10 @@ with its own icon on your Desktop and in the Start menu. To pin it, open **Start
    within a few seconds. To stop sending video, tap the red dot at the top of the iPhone and
    choose **Stop**.
 
+The Bluetooth part keeps running quietly in the background after you close the window,
+until Windows restarts. That's on purpose: each time it starts fresh, the iPhone can get
+confused and need pairing again. Open only **one** MirrorLink window at a time.
+
 ### Mouse and keyboard
 | On the PC | On the iPhone |
 |---|---|
@@ -137,12 +141,11 @@ with its own icon on your Desktop and in the Start menu. To pin it, open **Start
 | **Ctrl+2** | App Switcher |
 | **Ctrl+3** | Search |
 | **Ctrl+4** / **Ctrl+5** | Control Center / Notifications |
-| Ctrl+↑ / Ctrl+↓ | Volume up / down |
 | **Ctrl+K** | Show or hide the iPhone's on-screen keyboard |
 | Hover over the top of the window | **Home** and **App Switcher** buttons |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Window bigger / smaller / normal |
 | Ctrl+R | Rotate the view by hand (if a landscape app looks sideways) |
-| F1 / F5 / F11 / Ctrl+Q | Stats / restart control / fullscreen / quit |
+| F1 / F5 / F11 / Ctrl+Q | Stats / reconnect control (or take it back from another MirrorLink window) / fullscreen / quit |
 
 The window turns sideways when the phone or an app goes landscape.
 
@@ -201,7 +204,8 @@ shown in the app, if Wi-Fi discovery doesn't work), `--forget` (delete this PC's
 | Wi-Fi discovery doesn't work | Some routers block it. Use `run.bat --host <IP shown in the app>`. |
 | Works at home but not at school or work | Those networks often block devices from talking to each other. Use your iPhone's Personal Hotspot. |
 | Connected but the picture is black | Tap **Start Mirroring** on the phone, or move something on screen. |
-| *Control (Bluetooth): waiting for the iPhone* | iPhone **Settings → Bluetooth**: tap your PC's name. If it's listed but won't connect, tap ⓘ → **Forget This Device**, then pair again. |
+| *Control (Bluetooth): waiting for the iPhone* | iPhone **Settings → Bluetooth**: tap your PC's name. |
+| Your PC shows as **Connected** on the iPhone but has **no ⓘ**, and the pointer doesn't move | The iPhone has an out-of-date copy of the pairing. On the PC: **Settings → Bluetooth & devices → Devices**, remove **Apple iPhone** (and any other entry for your phone). On the iPhone: turn Bluetooth off and on, and if your PC has an ⓘ, **Forget This Device**. Then, with the viewer open, pair again. |
 | *…can't act as a keyboard/mouse* | Your PC's Bluetooth can't do it. A Bluetooth 5.0 USB adapter fixes it, or use `"control": "helper"`. |
 | *Bluetooth is off* | Windows Settings → Bluetooth & devices → turn Bluetooth on. |
 | Clicks do nothing, but it says connected | Turn on **AssistiveTouch** (setup step 5). |
