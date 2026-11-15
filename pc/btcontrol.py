@@ -79,7 +79,9 @@ class BtControl:
         if not s.get("published"):
             return "Control (Bluetooth): setting up…"
         if s.get("connected"):
-            return f"Control (Bluetooth): connected to {s.get('phone') or 'iPhone'}"
+            iv = s.get("interval_ms")
+            return (f"Control (Bluetooth): connected to {s.get('phone') or 'iPhone'}"
+                    + (f" · {iv:g} ms per update" if iv else ""))
         return (f"Control (Bluetooth): waiting for the iPhone — on the phone: Settings → Bluetooth → "
                 f"tap \"{s.get('pc') or 'this PC'}\" (first time only)")
 
