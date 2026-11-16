@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 
 PORT = 47830
-VERSION = 9          # the viewer restarts an older running copy (which means pairing again)
+VERSION = 10         # the viewer restarts an older running copy; the iPhone reconnects by itself
 FAKE_LOG = os.environ.get("MIRRORLINK_FAKE_HID_LOG")
 
 
@@ -189,10 +189,11 @@ class WinHid:
             BluetoothAdapter, BluetoothConnectionStatus, BluetoothError, BluetoothLEDevice,
             BluetoothLEPreferredConnectionParameters)
         import winrt.windows.devices.bluetooth.genericattributeprofile as gatt
-        from winrt.windows.storage.streams import DataWriter
+        from winrt.windows.storage.streams import DataReader, DataWriter
         self.w = dict(BluetoothAdapter=BluetoothAdapter, BluetoothConnectionStatus=BluetoothConnectionStatus,
                       BluetoothError=BluetoothError, BluetoothLEDevice=BluetoothLEDevice,
-                      Params=BluetoothLEPreferredConnectionParameters, DataWriter=DataWriter)
+                      Params=BluetoothLEPreferredConnectionParameters, DataWriter=DataWriter,
+                      DataReader=DataReader)
         self.g = gatt
         self.loop = loop
         self.changed = changed            # call when connection state changes
@@ -202,6 +203,9 @@ class WinHid:
         self.known: dict[str, dict] = {}
         self.lock = asyncio.Lock()
         self.last_sent = 0.0
+        self.sent_stats: dict[int, list] = {}   # report id -> [delivered, not delivered, last problem]
+        self.stats_since = time.monotonic()
+        self.last_control: int | None = None
         self.published = False
         self.problem: str | None = None
         self.generation = 0
@@ -390,13 +394,26 @@ class WinHid:
         return handler
 
     def _on_write(self, characteristic, args) -> None:
-        self.loop.call_soon_threadsafe(log, "the iPhone wrote the HID control point (it's using the keyboard/mouse)")
         deferral = args.get_deferral()
 
         async def take():
             try:
                 req = await args.get_request_async()
-                if req is not None and req.option == self.g.GattWriteOption.WRITE_WITH_RESPONSE:
+                if req is None:
+                    return
+                value = None
+                try:
+                    r = self.w["DataReader"].from_buffer(req.value)
+                    if r.unconsumed_buffer_length:
+                        value = r.read_byte()
+                except Exception:
+                    pass
+                if value != self.last_control:
+                    self.last_control = value
+                    what = {0: "suspend (it stopped listening to the keyboard/mouse)",
+                            1: "exit suspend (it's listening to the keyboard/mouse)"}.get(value, f"value {value}")
+                    log(f"the iPhone wrote the HID control point: {what}")
+                if req.option == self.g.GattWriteOption.WRITE_WITH_RESPONSE:
                     req.respond()
             finally:
                 deferral.complete()
@@ -694,15 +711,46 @@ class WinHid:
                 await asyncio.sleep(delay)
             self.last_sent = time.perf_counter()
             ok = False
+            problem = "nobody subscribed"
             for sub in list(c.subscribed_clients):
                 try:
                     if sub.session.session_status != self.g.GattSessionStatus.ACTIVE:
+                        problem = "session not active"
                         continue
                     r = await c.notify_value_async(buf, sub)
-                    ok = ok or r.status == 0            # GattCommunicationStatus.SUCCESS
+                    if r.status == 0:                   # GattCommunicationStatus.SUCCESS
+                        ok = True
+                    else:
+                        problem = f"status {r.status}, protocol error {r.protocol_error}"
                 except OSError as e:
+                    problem = f"error {e}"
                     log("notify failed:", e)
+            self._count(rid, ok, problem)
             return ok
+
+    REPORT_NAMES = {1: "keyboard", 2: "mouse", 3: "pointer", 4: "media keys"}
+
+    def _count(self, rid: int, ok: bool, problem: str) -> None:
+        """Every few seconds, log how many reports reached the iPhone (for troubleshooting)."""
+        st = self.sent_stats.setdefault(rid, [0, 0, ""])
+        if ok:
+            st[0] += 1
+        else:
+            st[1] += 1
+            st[2] = problem
+        now = time.monotonic()
+        if now - self.stats_since < 5:
+            return
+        parts = []
+        for k in sorted(self.sent_stats):
+            good, bad, why = self.sent_stats[k]
+            part = f"{self.REPORT_NAMES.get(k, k)} {good} delivered"
+            if bad:
+                part += f", {bad} NOT delivered ({why})"
+            parts.append(part)
+        log("sent to the iPhone:", " | ".join(parts))
+        self.sent_stats = {}
+        self.stats_since = now
 
 
 class FakeHid:
